@@ -62,73 +62,72 @@ function getFarmsList($pdo) {
     } catch (PDOException $e) { return []; }
 }
 
-// 밭별 최근/오래전 작업 경과일 계산 함수 (수정됨)
+// 밭별 최근/오래전 작업 경과일 계산 함수
+// (farmmngdtl.php 는 저장 시 선택하지 않은 이랑도 check_status='N' 으로 함께 INSERT 하므로
+//  N 행은 "작업 안 함" 채움 행임. 따라서 Y 행만 대상으로 한다.)
+// 1) check_status='Y' 기록 중 (farm_id,row_num,col_num,작업종류) 별 가장 최근 1건만 선택
+//    (Y 기록이 하나도 없는 이랑은 자연히 제외됨)
+// 2) 작업종류별로 최근일자(MAX)/가장 오래된 일자(MIN)의 오늘까지 경과일 산출
+// 작업 코드: 10=물, 20=수확, 30=옆순, 40~46=농약(가군/나군 → 40으로 통합), 70~72=병충해(70으로 통합)
 function getFarmTaskStats($pdo, $farmId) {
 
-	$sql = "
-		SELECT
-			farm_id,
-			task_id,
-			last_work_date,
-			last_elapsed_days,
-			first_work_date,
-			CASE
-				WHEN first_elapsed_days <= last_elapsed_days THEN '-'
-				ELSE first_elapsed_days
-			END AS first_elapsed_days
-		FROM (
-			SELECT
-				farm_id,
-				grouped_task_id AS task_id,
-				MAX(work_date) AS last_work_date,
-				DATEDIFF(CURDATE(), MAX(work_date)) AS last_elapsed_days,
-				MIN(work_date) AS first_work_date,
-				DATEDIFF(CURDATE(), MIN(work_date)) AS first_elapsed_days
-			FROM (
-				SELECT
-					id,
-					farm_id,
-					row_num,
-					col_num,
-					task_id,
-					CASE
-						WHEN task_id BETWEEN '40' AND '46' THEN '40'
-						WHEN task_id BETWEEN '70' AND '72' THEN '70'
-						ELSE task_id
-					END AS grouped_task_id,
-					work_date,
-					check_status,
-					created_at,
-					task_type,
-					ROW_NUMBER() OVER (
-						PARTITION BY
-							farm_id,
-							row_num,
-							col_num,
-							task_id
-						ORDER BY
-							created_at DESC,
-							id DESC
-					) AS rn
-				FROM ridge_records
-				WHERE farm_id = :farm_id
-				  and check_status = 'Y'
-			) r
-			WHERE r.rn = 1
-			GROUP BY
-				farm_id,
-				grouped_task_id
-		) t
-		ORDER BY
-			farm_id,
-			CAST(task_id AS UNSIGNED);
+    $sql = "
+        SELECT
+            task_id,
+            last_work_date,
+            last_elapsed_days,
+            first_work_date,
+            CASE
+                WHEN first_elapsed_days <= last_elapsed_days THEN '-'
+                ELSE first_elapsed_days
+            END AS first_elapsed_days
+        FROM (
+            SELECT
+                grouped_task_id AS task_id,
+                MAX(work_date) AS last_work_date,
+                DATEDIFF(CURDATE(), MAX(work_date)) AS last_elapsed_days,
+                MIN(work_date) AS first_work_date,
+                DATEDIFF(CURDATE(), MIN(work_date)) AS first_elapsed_days
+            FROM (
+                SELECT
+                    work_date,
+                    grouped_task_id,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY farm_id, row_num, col_num, grouped_task_id
+                        ORDER BY created_at DESC, id DESC
+                    ) AS rn
+                FROM (
+                    SELECT
+                        id,
+                        farm_id,
+                        row_num,
+                        col_num,
+                        work_date,
+                        check_status,
+                        created_at,
+                        CASE
+                            WHEN CAST(task_id AS UNSIGNED) BETWEEN 40 AND 46 THEN 40
+                            WHEN CAST(task_id AS UNSIGNED) BETWEEN 70 AND 72 THEN 70
+                            ELSE CAST(task_id AS UNSIGNED)
+                        END AS grouped_task_id
+                    FROM ridge_records
+                    WHERE farm_id = :farm_id
+                      AND check_status = 'Y'
+                      AND work_date IS NOT NULL
+                ) base
+            ) r
+            WHERE r.rn = 1
+            GROUP BY grouped_task_id
+        ) t
+        ORDER BY task_id
     ";
-	
+
     try {
         $stmt = $pdo->prepare($sql);
         $stmt->execute([':farm_id' => $farmId]);
         return $stmt->fetchAll(PDO::FETCH_ASSOC);
     } catch (PDOException $e) {
+        error_log('[farmmng] getFarmTaskStats error: ' . $e->getMessage());
         return [];
     }
 }
@@ -215,12 +214,12 @@ function renderFarmBox($title, $icon, $groupId, $bgColor, $memoData, $farmParam,
     $page = $memoData['page'];
     $totalPages = $memoData['totalPages'];
     
-    // 작업 ID 매핑 및 초기화 (10: 물, 20: 농약, 30: 수확, 40: 옆순)
+    // 작업 ID 매핑 및 초기화 (farmmngdtl.php $taskMap 기준: 10=물, 20=수확, 30=옆순, 40~46=농약→40)
     $tasks = [
-        '10' => ['last' => '-', 'first' => '-'],
-        '30' => ['last' => '-', 'first' => '-'],
-        '40' => ['last' => '-', 'first' => '-'],
-        '20' => ['last' => '-', 'first' => '-']
+        '10' => ['last' => '-', 'first' => '-'], // 💧 물
+        '20' => ['last' => '-', 'first' => '-'], // 🌾 수확
+        '30' => ['last' => '-', 'first' => '-'], // ✂️ 옆순
+        '40' => ['last' => '-', 'first' => '-']  // 💊 농약(40~46)
     ];
 
     if (!empty($taskStats)) {

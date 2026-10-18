@@ -276,6 +276,68 @@ function getCodesByGroup(groupName) {
                 loadPage('farmmng.php', '밭 관리');
             }
         };
+
+        /*
+         * 출고 관리의 년월 조회는 브라우저 전체 페이지를 이동하지 않고
+         * 현재 #content-area 안에서만 AJAX로 갱신합니다.
+         * menu.php의 loadPage()로 불러온 화면에도 동작하도록 위임 이벤트를 사용합니다.
+         */
+        document.addEventListener('submit', async function(event) {
+            const form = event.target.closest('form.shipping-ym-form');
+            if (!form) return;
+
+            event.preventDefault();
+
+            const monthInput = form.querySelector('[name="search_ym"]');
+            if (!monthInput || !monthInput.value) return;
+
+            const contentArea = document.getElementById('content-area');
+            if (!contentArea) return;
+
+            const requestUrl = new URL(form.getAttribute('action') || 'outbound.php', window.location.href);
+            requestUrl.searchParams.set('search_ym', monthInput.value);
+
+            const oldInputValue = monthInput.value;
+            monthInput.disabled = true;
+
+            try {
+                const response = await fetch(requestUrl.toString(), {
+                    method: 'GET',
+                    headers: { 'X-Requested-With': 'XMLHttpRequest' }
+                });
+
+                if (!response.ok) {
+                    throw new Error('HTTP ' + response.status);
+                }
+
+                const html = await response.text();
+                const fragmentHolder = document.createElement('div');
+                fragmentHolder.innerHTML = html;
+
+                // PHP 화면 조각의 style/HTML을 현재 컨텐츠 영역에만 적용합니다.
+                contentArea.innerHTML = fragmentHolder.innerHTML;
+
+                // innerHTML로 삽입된 스크립트는 자동 실행되지 않으므로 다시 생성해 실행합니다.
+                const scripts = Array.from(contentArea.querySelectorAll('script'));
+                for (const oldScript of scripts) {
+                    const newScript = document.createElement('script');
+                    for (const attr of Array.from(oldScript.attributes)) {
+                        newScript.setAttribute(attr.name, attr.value);
+                    }
+                    newScript.textContent = oldScript.textContent;
+                    oldScript.replaceWith(newScript);
+                }
+            } catch (error) {
+                console.error('출고 년월 조회 오류:', error);
+                alert('출고 데이터를 조회하지 못했습니다. 네트워크와 서버 파일 경로를 확인해 주세요.');
+                // 실패 시 선택한 년월 입력값을 유지하고 사용자가 다시 시도할 수 있게 합니다.
+                const currentInput = document.querySelector('form.shipping-ym-form [name="search_ym"]');
+                if (currentInput) currentInput.value = oldInputValue;
+            } finally {
+                const currentInput = document.querySelector('form.shipping-ym-form [name="search_ym"]');
+                if (currentInput) currentInput.disabled = false;
+            }
+        });
     </script>
 </body>
 </html>

@@ -94,8 +94,14 @@ if ($action) {
         exit;
     }
     if ($action === 'delete') {
-        $id = $_POST['id'] ?? 0;
+        $id = (int)($_POST['id'] ?? 0);
         if ($id) {
+            // 해당 할일의 첨부파일 정리 (이관된 복사본이 같은 실제 파일을 참조 중이면 파일은 유지됨)
+            $stAtt = $pdo->prepare("SELECT att_id FROM attachment WHERE att_grp_id = ? AND status = 'ACTIVE'");
+            $stAtt->execute([todoAttachmentGroupId($id)]);
+            foreach ($stAtt->fetchAll(PDO::FETCH_COLUMN) as $attId) {
+                todoDeleteAttachment((int)$attId, $pdo);
+            }
             $stmt = $pdo->prepare("DELETE FROM dailytasksT WHERE id = ?");
             $stmt->execute([$id]);
             echo "success";
@@ -155,6 +161,17 @@ if ($action) {
         $new_date = $_POST['new_date'] ?? '';
         $content = $_POST['content'] ?? '';
         if ($id && $new_date && $content) {
+            // 이관 날짜는 해당 할일이 등록된 날짜 이후여야 함
+            $stOrig = $pdo->prepare("SELECT task_date FROM dailytasksT WHERE id = ?");
+            $stOrig->execute([$id]);
+            $origDate = $stOrig->fetchColumn();
+            if ($origDate === false) { http_response_code(400); echo '할일을 찾을 수 없습니다.'; exit; }
+            if ($new_date <= substr((string)$origDate, 0, 10)) {
+                http_response_code(400);
+                echo '이관 날짜는 할일이 등록된 날짜(' . substr((string)$origDate, 0, 10) . ') 이후여야 합니다.';
+                exit;
+            }
+
             $stmt = $pdo->prepare("UPDATE dailytasksT SET completion_status = ? WHERE id = ?");
             $stmt->execute([$new_date, $id]);
             
@@ -211,9 +228,16 @@ $stmt = $pdo->prepare("SELECT COUNT(*) FROM dailytasksT WHERE task_date > ? AND 
 $stmt->execute([$viewDate]);
 $futureTotalCount = $stmt->fetchColumn();
 
-$stmt = $pdo->prepare("SELECT t.*, (SELECT COUNT(*) FROM attachment a WHERE a.att_grp_id = -t.id AND a.status='ACTIVE') AS attachment_count FROM dailytasksT t WHERE t.task_date = ? ORDER BY t.id DESC");
+// 오늘의 할일 목록: 이관된 항목(completion_status 가 날짜값)은 표시하지 않음
+$stmt = $pdo->prepare("SELECT t.*, (SELECT COUNT(*) FROM attachment a WHERE a.att_grp_id = -t.id AND a.status='ACTIVE') AS attachment_count FROM dailytasksT t WHERE t.task_date = ? AND (t.completion_status IS NULL OR t.completion_status = '' OR t.completion_status = '완료') ORDER BY t.id DESC");
 $stmt->execute([$viewDate]);
 $tasks = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+// 오늘 중 이관한 할일 목록 (이관 팝업용)
+$stmt = $pdo->prepare("SELECT t.*, (SELECT COUNT(*) FROM attachment a WHERE a.att_grp_id = -t.id AND a.status='ACTIVE') AS attachment_count FROM dailytasksT t WHERE t.task_date = ? AND t.completion_status IS NOT NULL AND t.completion_status <> '' AND t.completion_status <> '완료' ORDER BY t.id DESC");
+$stmt->execute([$viewDate]);
+$transferTasks = $stmt->fetchAll(PDO::FETCH_ASSOC);
+$transferCount = count($transferTasks);
 
 // 향후 미완료 할일 목록 재계산 (completion_status가 NULL 또는 빈 값인 경우)
 $stmt = $pdo->prepare("SELECT * FROM dailytasksT WHERE task_date > ? AND (completion_status IS NULL OR completion_status = '') ORDER BY task_date ASC, id DESC");
@@ -228,7 +252,10 @@ $futureTasks = $stmt->fetchAll(PDO::FETCH_ASSOC);
     .date-title-wrap { position: relative; font-size: 18px; font-weight: bold; color: #2c3e50; display: flex; align-items: center; }
     .today-badge { position: absolute; left: 100%; margin-left: 8px; font-size: 14px; color: #e74c3c; white-space: nowrap; }
     .stats-container { display: flex; flex-wrap: wrap; gap: 10px; justify-content: space-between; background-color: #ffffff; padding: 12px 10px; border-radius: 8px; margin-bottom: 20px; border: 1px solid #eee; box-shadow: 0 1px 4px rgba(0,0,0,0.05); }
-    .stat-item { display: flex; flex-direction: column; align-items: center; flex: 1; min-width: 20%; }
+    .stat-item { display: flex; flex-direction: column; align-items: center; flex: 1; min-width: 0; }
+    .stat-item.stat-clickable { cursor: pointer; }
+    .stat-item.stat-clickable:active { opacity: 0.6; }
+    .stat-value.transfer { color: #f39c12; }
     .stat-label { font-size: 11px; color: #7f8c8d; margin-bottom: 4px; text-align: center; }
     .stat-value { font-size: 16px; font-weight: bold; color: #2c3e50; }
     .stat-value.alert { color: #e74c3c; }
@@ -266,6 +293,15 @@ $futureTasks = $stmt->fetchAll(PDO::FETCH_ASSOC);
     .btn-undo { background-color: #e67e22; }
     .btn-close { background-color: #95a5a6; }
     .btn-save-date { background-color: #2c3e50; }
+    .btn-delete { background-color: #e74c3c; }
+    #transferListModal { z-index: 9998; } /* taskDetailModal 과 동일, DOM 순서상 상세 팝업이 위에 표시 */
+    .transfer-list-title { margin: 0 0 12px 0; color: #2c3e50; text-align: center; font-size: 16px; }
+    .transfer-list-body { max-height: 55vh; overflow-y: auto; margin-bottom: 15px; }
+    .transfer-item { display: flex; align-items: center; gap: 8px; padding: 12px 6px; border-bottom: 1px dashed #eee; font-size: 14px; cursor: pointer; color: #333; }
+    .transfer-item:hover { background-color: #f8f9fa; }
+    .transfer-item-text { flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .transfer-item-date { font-size: 12px; font-weight: bold; color: #f39c12; white-space: nowrap; }
+    .transfer-empty { padding: 20px; text-align: center; color: #999; font-size: 14px; }
     .date-picker-content input[type="date"] { width: 100%; padding: 12px; border: 1px solid #ddd; border-radius: 8px; margin-bottom: 15px; font-size: 15px; box-sizing: border-box;}
     .future-section { position: fixed; bottom: 60px; left: 0; right: 0; background-color: #fff; border-radius: 16px 16px 0 0; box-shadow: 0 -4px 15px rgba(0,0,0,0.1); z-index: 90; margin: 0; }
     .future-header { display: flex; justify-content: space-between; align-items: center; padding: 18px 20px; background-color: #f8f9fa; border-radius: 16px 16px 0 0; cursor: pointer; border-top: 1px solid #eee; }
@@ -293,8 +329,9 @@ $futureTasks = $stmt->fetchAll(PDO::FETCH_ASSOC);
 
 <div class="stats-container">
     <div class="stat-item"><span class="stat-label">이전 미완료</span><span class="stat-value <?= $prevIncompleteCount > 0 ? 'alert' : '' ?>"><?= $prevIncompleteCount ?></span></div>
-    <div class="stat-item"><span class="stat-label">오늘 총 할일</span><span class="stat-value"><?= $todayTotalCount ?></span></div>
+    <div class="stat-item"><span class="stat-label">오늘 총 할일</span><span class="stat-value" id="stat-total-count"><?= $todayTotalCount ?></span></div>
     <div class="stat-item"><span class="stat-label">오늘 미완료</span><span class="stat-value <?= $todayIncompleteCount > 0 ? 'alert' : '' ?>"><?= $todayIncompleteCount ?></span></div>
+    <div class="stat-item stat-clickable" onclick="openTransferList()"><span class="stat-label">오늘 중 이관</span><span class="stat-value transfer" id="stat-transfer-count"><?= $transferCount ?></span></div>
     <div class="stat-item"><span class="stat-label">오늘이후 할일</span><span class="stat-value"><?= $futureTotalCount ?></span></div>
 </div>
 
@@ -359,6 +396,32 @@ $futureTasks = $stmt->fetchAll(PDO::FETCH_ASSOC);
     </div>
 </div>
 
+<div class="detail-modal-overlay" id="transferListModal">
+    <div class="detail-modal-content">
+        <h4 class="transfer-list-title">오늘 중 이관한 할일 <span id="transfer-list-count">(<?= $transferCount ?>건)</span></h4>
+        <div class="transfer-list-body" id="transfer-list-body">
+            <?php if ($transferCount === 0): ?>
+                <div class="transfer-empty">이관한 할일이 없습니다.</div>
+            <?php else: ?>
+                <?php foreach ($transferTasks as $ttask): ?>
+                    <div class="transfer-item"
+                         data-id="<?= $ttask['id'] ?>"
+                         data-content="<?= htmlspecialchars($ttask['content'], ENT_QUOTES) ?>"
+                         data-status="<?= htmlspecialchars($ttask['completion_status'] ?? '', ENT_QUOTES) ?>"
+                         onclick="openTaskDetail(this)">
+                        <span class="transfer-item-text"><?= htmlspecialchars($ttask['content']) ?></span>
+                        <?php if ((int)$ttask['attachment_count'] > 0): ?><span title="첨부파일 <?= (int)$ttask['attachment_count'] ?>개">📎</span><?php endif; ?>
+                        <span class="transfer-item-date">→ <?= htmlspecialchars($ttask['completion_status']) ?></span>
+                    </div>
+                <?php endforeach; ?>
+            <?php endif; ?>
+        </div>
+        <div class="modal-btn-group">
+            <button class="modal-btn btn-close" onclick="closeTransferList()">닫기</button>
+        </div>
+    </div>
+</div>
+
 <div class="detail-modal-overlay" id="taskDetailModal">
     <div class="detail-modal-content">
         <input type="hidden" id="modal-task-id">
@@ -381,6 +444,7 @@ $futureTasks = $stmt->fetchAll(PDO::FETCH_ASSOC);
             <button class="modal-btn btn-complete" id="btnComplete" onclick="setTaskComplete()">완료</button>
             <button class="modal-btn btn-changedate" id="btnChangeDate" onclick="openDatePicker()">날짜변경</button>
             <button class="modal-btn btn-undo" id="btnUndo" onclick="undoTaskComplete()">완료취소</button>
+            <button class="modal-btn btn-delete" id="btnDelete" onclick="deleteTransferredTask()">삭제</button>
             <button class="modal-btn btn-close" onclick="closeTaskDetail()">닫기</button>
         </div>
     </div>
@@ -398,8 +462,9 @@ $futureTasks = $stmt->fetchAll(PDO::FETCH_ASSOC);
 </div>
 
 <script>
-    let existingFileCountForDetail = 0;
-    let editSelectedFilesForDetail = [];
+    // loadPage() 로 화면이 다시 로드되어 스크립트가 재실행돼도 오류가 나지 않도록 var 사용
+    var existingFileCountForDetail = 0;
+    var editSelectedFilesForDetail = [];
 
     function toggleFutureTasks() {
         const content = document.getElementById('future-tasks-content');
@@ -460,19 +525,23 @@ $futureTasks = $stmt->fetchAll(PDO::FETCH_ASSOC);
         const btnComplete = document.getElementById('btnComplete');
         const btnChangeDate = document.getElementById('btnChangeDate');
         const btnUndo = document.getElementById('btnUndo');
+        const btnDelete = document.getElementById('btnDelete');
         const textarea = document.getElementById('modal-task-content');
         
         btnEdit.style.display = 'none';
         btnComplete.style.display = 'none';
         btnChangeDate.style.display = 'none';
         btnUndo.style.display = 'none';
+        btnDelete.style.display = 'none';
         textarea.removeAttribute('readonly');
 
         if (status === '완료') {
             textarea.setAttribute('readonly', true);
             if (dateStatus !== -1) { btnUndo.style.display = 'block'; }
         } else if (status !== '') {
+            // 이관된 할일: 읽기 전용 + 삭제만 가능
             textarea.setAttribute('readonly', true);
+            btnDelete.style.display = 'block';
         } else {
             if (dateStatus === -1) {
                 textarea.setAttribute('readonly', true);
@@ -580,7 +649,8 @@ $futureTasks = $stmt->fetchAll(PDO::FETCH_ASSOC);
     }
 
     // 파일 선택 시 이벤트
-    document.addEventListener('change', function(e) {
+    if (window.__dtChangeHandler) document.removeEventListener('change', window.__dtChangeHandler);
+    window.__dtChangeHandler = function(e) {
         if (e.target && e.target.id === 'modal-attachments') {
             const maxFiles = window.TODO_ATTACHMENT_MAX_FILES || 5;
             const allowedExt = window.TODO_ATTACHMENT_EXTENSIONS || [];
@@ -610,7 +680,8 @@ $futureTasks = $stmt->fetchAll(PDO::FETCH_ASSOC);
             }
             syncDetailSelectedFilesAndRender();
         }
-    });
+    };
+    document.addEventListener('change', window.__dtChangeHandler);
 
     function removeDetailSelectedFile(index) {
         if (index >= 0 && index < editSelectedFilesForDetail.length) {
@@ -658,6 +729,42 @@ $futureTasks = $stmt->fetchAll(PDO::FETCH_ASSOC);
     function escapeHtml(v) { const d=document.createElement('div'); d.textContent=v??''; return d.innerHTML; }
 
     function closeTaskDetail() { document.getElementById('taskDetailModal').style.display = 'none'; }
+
+    // ===== 오늘 중 이관 목록 팝업 =====
+    function openTransferList() { document.getElementById('transferListModal').style.display = 'flex'; }
+    function closeTransferList() { document.getElementById('transferListModal').style.display = 'none'; }
+
+    // 이관된 할일 삭제 (taskDetailModal 의 [삭제] 버튼)
+    function deleteTransferredTask() {
+        const id = document.getElementById('modal-task-id').value;
+        if (!id) return;
+        if (!confirm('이관된 할일 기록을 삭제할까?\n(이관된 날짜에 등록된 할일은 그대로 유지돼)')) return;
+
+        const formData = new FormData();
+        formData.append('id', id);
+        fetch('dailytasks.php?action=delete', { method: 'POST', body: formData })
+        .then(res => res.text()).then(data => {
+            if (data.trim() !== 'success') return alert('삭제 중 오류가 발생했어.');
+
+            closeTaskDetail();
+
+            // 이관 목록에서 해당 항목 제거
+            const item = document.querySelector('#transfer-list-body .transfer-item[data-id="' + id + '"]');
+            if (item) item.remove();
+
+            const remain = document.querySelectorAll('#transfer-list-body .transfer-item').length;
+            document.getElementById('stat-transfer-count').textContent = remain;
+            document.getElementById('transfer-list-count').textContent = '(' + remain + '건)';
+
+            // 오늘 총 할일(이관 포함)도 1 감소
+            const totalEl = document.getElementById('stat-total-count');
+            if (totalEl) totalEl.textContent = Math.max(0, parseInt(totalEl.textContent, 10) - 1);
+
+            if (remain === 0) {
+                document.getElementById('transfer-list-body').innerHTML = '<div class="transfer-empty">이관한 할일이 없습니다.</div>';
+            }
+        });
+    }
 
     // [수정] 버튼 클릭 시 할일 내용 수정과 새 첨부파일 업로드를 동시 처리
     function updateTaskContent() {
@@ -723,15 +830,21 @@ $futureTasks = $stmt->fetchAll(PDO::FETCH_ASSOC);
         });
     }
 
+    // 'YYYY-MM-DD' 문자열에 n일을 더한 날짜 문자열 반환
+    function addDaysToDateString(dateStr, n) {
+        const parts = dateStr.split('-');
+        const d = new Date(parts[0], parts[1] - 1, parts[2]);
+        d.setDate(d.getDate() + n);
+        return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
+    }
+
     function openDatePicker() {
-        const today = new Date();
-        const tomorrow = new Date(today.getTime());
-        tomorrow.setDate(today.getDate() + 1);
-        const localTomorrow = new Date(tomorrow.getTime() - (tomorrow.getTimezoneOffset() * 60000)).toISOString().split('T')[0];
-        
+        // 이관 가능 날짜: 해당 할일이 등록된 날짜(현재 조회 중인 날짜)의 다음날부터
+        const minDate = addDaysToDateString(getCurrentViewDate(), 1);
+
         const dateInput = document.getElementById('new-task-date');
-        dateInput.min = localTomorrow;
-        dateInput.value = localTomorrow;
+        dateInput.min = minDate;
+        dateInput.value = minDate;
         document.getElementById('datePickerModal').style.display = 'flex';
     }
 
@@ -744,7 +857,7 @@ $futureTasks = $stmt->fetchAll(PDO::FETCH_ASSOC);
         const currentView = getCurrentViewDate();
 
         if (!newDate) return alert('변경할 날짜를 선택해 줘!');
-        if (newDate === currentView) return alert('이미 같은 날짜야!');
+        if (newDate <= currentView) return alert('이관 날짜는 할일이 등록된 날짜(' + currentView + ') 이후여야 해!');
 
         const formData = new FormData();
         formData.append('id', id);
@@ -752,12 +865,18 @@ $futureTasks = $stmt->fetchAll(PDO::FETCH_ASSOC);
         formData.append('new_date', newDate);
 
         fetch('dailytasks.php?action=change_date', { method: 'POST', body: formData })
-        .then(res => res.text()).then(data => {
+        .then(async res => {
+            const text = await res.text();
+            if (!res.ok) throw new Error(text);
+            return text;
+        })
+        .then(data => {
             if (data.trim() === 'success') {
                 closeDatePicker();
                 closeTaskDetail();
                 refreshCurrentView(currentView);
             }
-        });
+        })
+        .catch(err => alert(err.message || '날짜 변경 중 오류가 발생했어.'));
     }
 </script>
