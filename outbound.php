@@ -168,6 +168,19 @@ foreach ($farms as $f) {
     $farmIdMap[(int)$f['farm_id']] = true;
 }
 
+/* --------------------------------------------------
+ * 밭 이름 드랍다운용 목록 : 사용 중인 밭(use_yn = 'Y')만, 정렬순서(sort_order) → 밭 ID 순
+ *   ※ $farms(전체 밭)는 저장 시 farm_id 검증용이므로 그대로 둔다.
+ *     (이미 등록된 출고 Row 가 사용 안 함 밭이어도 저장이 막히지 않도록)
+ * -------------------------------------------------- */
+$activeFarms = [];
+try {
+    $activeFarms = $pdo->query("SELECT farm_id, farm_name FROM farms WHERE use_yn = 'Y' ORDER BY sort_order ASC, farm_id ASC")
+        ->fetchAll(PDO::FETCH_ASSOC);
+} catch (PDOException $e) {
+    $activeFarms = [];
+}
+
 // 메모 그룹 ID (memoT.group_id)
 $memoGroupId = 'outbound';
 
@@ -659,8 +672,14 @@ foreach ($rows as $row) {
 // JS 로 전달할 밭 목록
 $farmsForJs = array_map(
     static fn(array $f): array => ['id' => (int)$f['farm_id'], 'name' => (string)$f['farm_name']],
-    $farms
+    $activeFarms   // 사용 중인 밭만, sort_order 순
 );
+
+// 전체 밭 이름 (farm_id → 이름) : 수정 팝업에서 '사용 안 함' 밭의 기존 Row 의 밭 이름을 보존하기 위함
+$farmNamesForJs = [];
+foreach ($farms as $f) {
+    $farmNamesForJs[(int)$f['farm_id']] = (string)$f['farm_name'];
+}
 
 ?>
 
@@ -1336,7 +1355,7 @@ $farmsForJs = array_map(
             <div class="shipping-form-group" style="margin-bottom:0;">
                 <label for="shipping-farm">밭 이름</label>
                 <select id="shipping-farm">
-                    <?php foreach ($farms as $f) { ?>
+                    <?php foreach ($activeFarms as $f) { ?>
                         <option value="<?= (int)$f['farm_id'] ?>"><?= outbound_h($f['farm_name']) ?></option>
                     <?php } ?>
                 </select>
@@ -1431,6 +1450,7 @@ if (typeof currentEditingRow === 'undefined') {
 
 // 서버에서 전달받은 값 (재실행되어도 오류가 나지 않도록 window 에 보관)
 window.OUTBOUND_FARMS = <?= json_encode($farmsForJs, JSON_UNESCAPED_UNICODE | JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT) ?>;
+window.OUTBOUND_FARM_NAMES = <?= json_encode((object)$farmNamesForJs, JSON_UNESCAPED_UNICODE | JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT) ?>;
 window.OUTBOUND_SEARCH_YM = <?= json_encode($search_ym) ?>;
 
 // 선택된 년월의 메모 (key = YYYYMMDD + 밭ID → 내용)
@@ -1578,11 +1598,25 @@ function escHtml(str) {
 }
 
 // 밭 select 의 <option> 목록 생성 (value = farm_id)
+//  - window.OUTBOUND_FARMS : 사용 중인 밭(use_yn = 'Y')만, sort_order 순
+//  - 수정 중인 Row 의 밭이 '사용 안 함'이면 목록에 없으므로, 밭이 임의로 바뀌지 않도록
+//    그 밭을 마지막에 '(사용안함)' 표시로 추가하여 선택된 상태로 둔다.
 function buildFarmOptions(selectedId) {
-    return (window.OUTBOUND_FARMS || []).map(function (f) {
+    const farms = window.OUTBOUND_FARMS || [];
+    let html = farms.map(function (f) {
         const sel = String(f.id) === String(selectedId) ? 'selected' : '';
-        return '<option value="' + f.id + '" ' + sel + '>' + escHtml(f.name) + '</option>';
+        return '<option value="' + f.id + '" data-name="' + escHtml(f.name) + '" ' + sel + '>' + escHtml(f.name) + '</option>';
     }).join('');
+
+    const hasSelected = selectedId !== undefined && selectedId !== null && String(selectedId) !== '';
+    const inList = farms.some(function (f) { return String(f.id) === String(selectedId); });
+    if (hasSelected && !inList) {
+        const name = (window.OUTBOUND_FARM_NAMES || {})[String(selectedId)];
+        if (name) {
+            html += '<option value="' + escHtml(selectedId) + '" data-name="' + escHtml(name) + '" selected>' + escHtml(name) + ' (사용안함)</option>';
+        }
+    }
+    return html;
 }
 
 function openNewShippingModal() {
@@ -1705,7 +1739,9 @@ function saveShippingRow() {
         const dateVal = document.getElementById('edit-single-date').value;
         const farmSel = document.getElementById('edit-single-farm');
         const farmIdVal = farmSel.value;
-        const farmNameVal = farmSel.selectedIndex >= 0 ? farmSel.options[farmSel.selectedIndex].text : '';
+        const farmNameVal = farmSel.selectedIndex >= 0
+            ? (farmSel.options[farmSel.selectedIndex].dataset.name || farmSel.options[farmSel.selectedIndex].text)
+            : '';
         const productVal = document.getElementById('edit-single-product').value;
         const qtyVal = document.getElementById('edit-single-qty').value || '0';
         const disposalVal = document.getElementById('edit-single-disposal').value || '0';

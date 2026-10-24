@@ -9,8 +9,15 @@
  *   경매단가, 입금액)를 그리드로 보여준다.
  *     · farm_income(수익) + outbound(출고, outbound_id 로 연결) + farms(밭 이름, farm_id 로 연결)
  *     · 상세 데이터는 GET ?action=detail&year=YYYY&month=M 요청에 JSON 으로 응답한다.
+ * - 상세 그리드는 사용 중인 밭(farms.use_yn = 'Y')의 수익만 표시한다.
  * - 상세 그리드 정렬 : 1) 일자 ASC  2) 밭 정렬순서(farms.sort_order) ASC
  *     · 같은 일자는 날짜 셀을, 같은 일자 안에서 같은 밭(farm_id)은 밭 이름 셀과 메모 셀을 세로로 병합(rowspan)한다.
+ * - 팝업 구성 : 타이틀(YYYY년 M월 수익 내역) → [밭별 합계](한 Row 에 밭 2개) → [일자별 상세] 그리드
+ *     · 밭별 합계 : 해당 월 입금액을 밭(farm_id) 별로 합산, 밭 정렬순서(farms.sort_order) 순
+ *       수익이 없는 밭도 사용 중인 모든 밭(farms.use_yn = 'Y')을 표시한다. (수익 없는 밭의 금액은 '-')
+ *       사용 안 함(use_yn <> 'Y') 밭은 밭별 합계와 일자별 상세 모두에 표시하지 않는다.
+ *     · 일자별 상세 그리드는 헤더 + 데이터 15행 + 풋터(합계) 높이로 고정하고, 15행을 넘으면 헤더/풋터를 제외한
+ *       본문만 스크롤된다. 15행 미만이면 빈 행으로 채워 같은 높이를 유지한다.
  * - 상세 그리드 마지막에 [메모] 컬럼이 있다.
  *     · 해당 출고일자 + 해당 밭의 메모(memoT : group_id='outbound', id=YYYYMMDD+밭ID)가 있으면 메모 아이콘 표시
  *       (내용이 없거나 0 바이트이면 아이콘 숨김)
@@ -65,6 +72,7 @@ if (($_GET['action'] ?? '') === 'detail') {
                 COALESCE(o.outbound_date, fi.income_date) AS outbound_date,
                 fi.farm_id                                AS farm_id,
                 COALESCE(f.farm_name, '')                 AS farm_name,
+                COALESCE(f.sort_order, 2147483647)        AS farm_sort,
                 COALESCE(o.product_type, '')              AS product_type,
                 COALESCE(o.quantity, 0)                   AS quantity,
                 COALESCE(o.disposal, 0)                   AS disposal,
@@ -77,6 +85,7 @@ if (($_GET['action'] ?? '') === 'detail') {
                    ON f.farm_id = fi.farm_id
             WHERE fi.income_date >= :start_date
               AND fi.income_date <  :end_date
+              AND f.use_yn = 'Y'                                -- 사용 중인 밭만 (사용 안 함 밭은 제외)
             ORDER BY
                 COALESCE(o.outbound_date, fi.income_date) ASC,   -- 1. 일자 오름차순
                 COALESCE(f.sort_order, 2147483647) ASC,          -- 2. 밭 정렬순서(farms.sort_order) 오름차순
@@ -104,6 +113,7 @@ if (($_GET['action'] ?? '') === 'detail') {
                 'farm_id'            => (int)$r['farm_id'],
                 'outbound_date'      => (string)$r['outbound_date'],
                 'farm_name'          => (string)$r['farm_name'],
+                'farm_sort'          => (int)$r['farm_sort'],
                 'product_type'       => (string)$r['product_type'],
                 'quantity'           => (float)$r['quantity'],
                 'disposal'           => (float)$r['disposal'],
@@ -133,11 +143,30 @@ if (($_GET['action'] ?? '') === 'detail') {
             }
         }
 
+        /* ----------------------------------------------
+         * 사용 중인(use_yn = 'Y') 밭 목록 (수익이 없는 밭도 밭별 합계에 표시하기 위함) : 정렬순서(sort_order) → 밭 ID 순
+         * ---------------------------------------------- */
+        $farmList = [];
+        $farmStmt = $pdo->query(
+            "SELECT farm_id, COALESCE(farm_name, '') AS farm_name, COALESCE(sort_order, 2147483647) AS farm_sort
+               FROM farms
+              WHERE use_yn = 'Y'
+              ORDER BY COALESCE(sort_order, 2147483647) ASC, farm_id ASC"
+        );
+        foreach ($farmStmt->fetchAll(PDO::FETCH_ASSOC) as $fr) {
+            $farmList[] = [
+                'farm_id'   => (int)$fr['farm_id'],
+                'farm_name' => (string)$fr['farm_name'],
+                'farm_sort' => (int)$fr['farm_sort'],
+            ];
+        }
+
         farm_income_json([
             'success' => true,
             'year'    => (int)$dYear,
             'month'   => (int)$dMonth,
             'items'   => $items,
+            'farms'   => $farmList,
             'memos'   => (object)$memos, // { "메모ID": "내용" }  (비어 있어도 JSON 객체로 반환)
         ]);
     } catch (Throwable $e) {
@@ -400,9 +429,56 @@ $yearCount = array_sum($monthCount);
         white-space: pre-wrap;
         word-break: break-all;
     }
-    .income-detail-container {
+    /* 팝업 본문 영역 (밭별 합계 + 일자별 상세). 화면이 작아 넘칠 때만 이 영역이 스크롤된다. */
+    .income-detail-wrap {
         flex: 1 1 auto;
         min-height: 60px;
+        overflow-y: auto;
+    }
+    .income-detail-subtitle {
+        margin: 10px 0 6px;
+        font-size: 13px;
+        font-weight: bold;
+        color: #4a148c;
+        text-align: center;
+    }
+    .income-detail-subtitle.first { margin-top: 2px; }
+    /* 밭별 합계 : 밭이름 | 금액 | 밭이름 | 금액 */
+    /* 밭이 7개 이상(4줄 이상)이면 이 영역이 3줄(밭 6개) 높이로 제한되어 스크롤된다. (높이 제한은 JS) */
+    .income-farm-sum-wrap {
+        box-sizing: content-box;
+        overflow-y: auto;
+        border-top: 1px solid #d1c4e9;
+        border-left: 1px solid #d1c4e9;
+    }
+    .income-farm-sum {
+        width: 100%;
+        table-layout: fixed;
+        border-collapse: separate;
+        border-spacing: 0;
+        font-size: 12px;
+    }
+    .income-farm-sum td {
+        height: 26px;
+        padding: 0 6px;
+        border-width: 0 1px 1px 0;
+        border-style: solid;
+        border-color: #d1c4e9;
+        background-color: #fff;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+    }
+    .income-farm-sum td.name {
+        text-align: center;
+        font-weight: bold;
+        color: #4a148c;
+        background-color: #f3e5f5;
+    }
+    .income-farm-sum td.amt { text-align: right; }
+    /* 일자별 상세 그리드 : 높이는 JS 가 (헤더 + 15행 + 풋터) 로 고정, 본문만 스크롤 */
+    .income-detail-container {
+        box-sizing: content-box;
         overflow: auto;
         border-top: 1px solid #d1c4e9;
         border-left: 1px solid #d1c4e9;
@@ -428,7 +504,9 @@ $yearCount = array_sum($monthCount);
         border-color: #d1c4e9;
     }
     .income-detail-table td {
-        padding: 4px 4px;
+        height: 26px;
+        padding: 0 4px;
+        line-height: 1.2;
         border-width: 0 1px 1px 0;
         border-style: solid;
         border-color: #e0e0e0;
@@ -442,6 +520,9 @@ $yearCount = array_sum($monthCount);
     .income-detail-table tr.detail-total td {
         background-color: #ede7f6;
         font-weight: bold;
+        position: sticky;   /* 풋터는 스크롤되지 않고 아래에 고정 */
+        bottom: 0;
+        z-index: 2;
     }
     .income-detail-msg {
         padding: 20px;
@@ -535,7 +616,7 @@ $yearCount = array_sum($monthCount);
 <div class="income-modal-overlay" id="incomeDetailModal" onclick="if (event.target === this) farmIncomeCloseDetail();">
     <div class="income-modal-content">
         <h3 id="incomeDetailTitle">수익 내역</h3>
-        <div class="income-detail-container" id="incomeDetailBody"></div>
+        <div class="income-detail-wrap" id="incomeDetailBody"></div>
         <div class="income-modal-actions">
             <button type="button" onclick="farmIncomeCloseDetail()">닫기</button>
         </div>
@@ -589,6 +670,7 @@ function farmIncomeOpenDetail(year, month) {
 
     document.getElementById('incomeDetailTitle').innerText = year + '년 ' + month + '월 수익 내역';
     window.farmIncomeMemos = {};
+    window.farmIncomeFarms = [];
     body.innerHTML = '<div class="income-detail-msg">불러오는 중...</div>';
     modal.style.display = 'flex';
 
@@ -607,6 +689,7 @@ function farmIncomeOpenDetail(year, month) {
                 return;
             }
             window.farmIncomeMemos = data.memos || {};
+            window.farmIncomeFarms = data.farms || [];
             farmIncomeRenderDetail(body, data.items || []);
         })
         .catch(function () {
@@ -629,14 +712,79 @@ function farmIncomeCloseMemo() {
     if (modal) modal.style.display = 'none';
 }
 
+// 밭별 합계 (한 Row 에 밭 2개 : 밭이름 | 금액 | 밭이름 | 금액)
+function farmIncomeBuildFarmSummary(items) {
+    const map = {};
+    const keys = [];
+    function ensureFarm(id, name, sort) {
+        const k = String(id);
+        if (!map[k]) {
+            map[k] = { id: Number(id) || 0, sort: Number(sort), name: name || '', sum: 0, hasIncome: false };
+            if (isNaN(map[k].sort)) map[k].sort = 2147483647;
+            keys.push(k);
+        }
+        return map[k];
+    }
+
+    // 1) 사용 중인(use_yn = 'Y') 밭 등록 (수익이 없는 밭도 표시)
+    (window.farmIncomeFarms || []).forEach(function (f) { ensureFarm(f.farm_id, f.farm_name, f.farm_sort); });
+    if (keys.length === 0) return ''; // 표시할 밭이 없으면 밭별 합계 영역 자체를 숨김
+
+    // 2) 해당 월 입금액 합산 (사용 안 함 밭의 수익은 밭별 합계에 포함하지 않음)
+    items.forEach(function (it) {
+        const f = map[String(it.farm_id)];
+        if (!f) return;
+        f.sum += Number(it.deposit_amount) || 0;
+        f.hasIncome = true;
+    });
+
+    // 밭 정렬순서(farms.sort_order) → 밭 ID 순
+    const farms = keys.map(function (k) { return map[k]; }).sort(function (a, b) {
+        return (a.sort - b.sort) || (a.id - b.id);
+    });
+
+    let html = '<div class="income-detail-subtitle first">밭별 합계</div>'
+        + '<div class="income-farm-sum-wrap"><table class="income-farm-sum"><colgroup><col style="width:20%"><col style="width:30%"><col style="width:20%"><col style="width:30%"></colgroup><tbody>';
+    for (let i = 0; i < farms.length; i += 2) {
+        const a = farms[i];
+        const b = farms[i + 1]; // 밭 수가 홀수이면 마지막 Row 의 두 번째 칸은 빈 칸
+        html += '<tr>'
+            + '<td class="name">' + farmIncomeEsc(a.name) + '</td><td class="amt">' + (a.hasIncome ? farmIncomeNum(a.sum) : '-') + '</td>'
+            + (b
+                ? '<td class="name">' + farmIncomeEsc(b.name) + '</td><td class="amt">' + (b.hasIncome ? farmIncomeNum(b.sum) : '-') + '</td>'
+                : '<td></td><td></td>')
+            + '</tr>';
+    }
+    return html + '</tbody></table></div>';
+}
+
+// 밭별 합계 : 밭 6개(3줄)까지는 그대로 표시, 그 이상이면 3줄 높이로 제한하고 스크롤
+function farmIncomeLimitSummary(body) {
+    const SUMMARY_VISIBLE_ROWS = 3;
+    const sumWrap = body.querySelector('.income-farm-sum-wrap');
+    const sumRows = sumWrap ? sumWrap.querySelectorAll('tr') : [];
+    if (sumWrap && sumRows.length > SUMMARY_VISIBLE_ROWS) {
+        let sh = 0;
+        for (let r = 0; r < SUMMARY_VISIBLE_ROWS; r++) sh += sumRows[r].offsetHeight;
+        sumWrap.style.maxHeight = sh + 'px';
+    }
+}
+
 function farmIncomeRenderDetail(body, items) {
     if (items.length === 0) {
-        body.innerHTML = '<div class="income-detail-msg">해당 월의 수익 내역이 없어.</div>';
+        // 수익 내역이 없는 달도 밭별 합계(전 밭 '-')는 표시
+        const emptySummary = (window.farmIncomeFarms || []).length > 0 ? farmIncomeBuildFarmSummary(items) : '';
+        body.innerHTML = emptySummary + '<div class="income-detail-msg">해당 월의 수익 내역이 없어.</div>';
+        farmIncomeLimitSummary(body);
         return;
     }
 
+    const VISIBLE_ROWS = 15; // 일자별 상세 그리드에 항상 보이는 데이터 행 수 (초과하면 본문만 스크롤)
+
     let totalQty = 0, totalDisposal = 0, totalDeposit = 0;
-    let html = '<table class="income-detail-table"><thead><tr>'
+    let html = farmIncomeBuildFarmSummary(items)
+        + '<div class="income-detail-subtitle">일자별 상세</div>'
+        + '<div class="income-detail-container"><table class="income-detail-table"><thead><tr>'
         + '<th>날짜</th><th>밭</th><th>상품<br>종류</th><th>수<br>량</th><th>폐<br>기</th><th>경매<br>단가</th><th>입금액</th><th>메모</th>'
         + '</tr></thead><tbody>';
 
@@ -699,15 +847,33 @@ function farmIncomeRenderDetail(body, items) {
             + '</tr>';
     });
 
-    html += '<tr class="detail-total">'
+    // 데이터가 15행 미만이면 빈 행으로 채워 (헤더 + 15행 + 풋터) 높이를 유지
+    for (let f = items.length; f < VISIBLE_ROWS; f++) {
+        html += '<tr class="detail-filler"><td></td><td></td><td></td><td></td><td></td><td></td><td></td><td></td></tr>';
+    }
+
+    html += '</tbody><tfoot><tr class="detail-total">'
         + '<td colspan="3">합계 (' + items.length + '건)</td>'
         + '<td class="text-right">' + farmIncomeNum(totalQty) + '</td>'
         + '<td class="text-right">' + farmIncomeNum(totalDisposal) + '</td>'
         + '<td class="text-right"> </td>'
         + '<td class="text-right">' + farmIncomeNum(totalDeposit) + '</td>'
         + '<td> </td>'
-        + '</tr></tbody></table>';
+        + '</tr></tfoot></table></div>';
 
     body.innerHTML = html;
+
+    farmIncomeLimitSummary(body);
+
+    // 그리드 높이 고정 : 헤더 + 데이터 15행 + 풋터 (실제 렌더링된 높이를 측정)
+    const wrap = body.querySelector('.income-detail-container');
+    const table = wrap ? wrap.querySelector('table') : null;
+    if (wrap && table && table.tHead && table.tFoot) {
+        let h = table.tHead.offsetHeight + table.tFoot.offsetHeight;
+        for (let r = 0; r < VISIBLE_ROWS && r < table.tBodies[0].rows.length; r++) {
+            h += table.tBodies[0].rows[r].offsetHeight;
+        }
+        wrap.style.height = h + 'px';
+    }
 }
 </script>

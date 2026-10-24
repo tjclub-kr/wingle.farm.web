@@ -68,12 +68,52 @@ if ($action) {
             $task_date = trim($_POST['task_date'] ?? '');
             $content = trim($_POST['content'] ?? '');
             if (!$task_date || !$content) throw new RuntimeException('날짜와 할일 내용을 입력해 주세요.');
-            $stmt = $pdo->prepare("INSERT INTO dailytasksT (task_date, content, completion_status) VALUES (?, ?, '')");
-            $stmt->execute([$task_date, $content]);
+            // 해당 일자에 이미 등록된 할일 다음 순서(sort_order = 최대값 + 1)로 등록
+            $stmt = $pdo->prepare("INSERT INTO dailytasksT (task_date, content, completion_status, sort_order) SELECT ?, ?, '', COALESCE(MAX(sort_order), 0) + 1 FROM dailytasksT WHERE task_date = ?");
+            $stmt->execute([$task_date, $content, $task_date]);
             $taskId=(int)$pdo->lastInsertId();
             if (isset($_FILES['attachments'])) todoUploadFiles($_FILES['attachments'],$taskId,$pdo,$TODO_ATTACHMENT_MAX_FILES,$TODO_ATTACHMENT_EXTENSIONS,$TODO_ATTACHMENT_MAX_SIZE);
             echo "success";
         } catch (Throwable $e) { http_response_code(400); echo $e->getMessage(); }
+        exit;
+    }
+    if ($action === 'move_task') {
+        // 위/아래 화살표 : 화면에서 바로 위(아래)에 있던 할일과 sort_order 값을 서로 바꾼다. (2개 Row UPDATE)
+        try {
+            $id = (int)($_POST['id'] ?? 0);
+            $targetId = (int)($_POST['target_id'] ?? 0);
+            if (!$id || !$targetId || $id === $targetId) throw new RuntimeException('이동 대상이 올바르지 않습니다.');
+
+            $pdo->beginTransaction();
+
+            $readStmt = $pdo->prepare("SELECT id, task_date, sort_order FROM dailytasksT WHERE id IN (?, ?) FOR UPDATE");
+            $readStmt->execute([$id, $targetId]);
+            $rows = [];
+            foreach ($readStmt->fetchAll(PDO::FETCH_ASSOC) as $r) $rows[(int)$r['id']] = $r;
+            if (count($rows) !== 2) throw new RuntimeException('할일을 찾을 수 없습니다. 화면을 다시 조회해 주세요.');
+            if ($rows[$id]['task_date'] !== $rows[$targetId]['task_date']) throw new RuntimeException('같은 일자의 할일끼리만 순서를 바꿀 수 있습니다.');
+
+            // 두 할일의 sort_order 가 같으면 값을 바꿔도 순서가 변하지 않으므로,
+            // 해당 일자 전체를 현재 조회 순서(sort_order, 등록일, id)대로 1..n 으로 다시 부여한 뒤 교환한다.
+            if ((int)$rows[$id]['sort_order'] === (int)$rows[$targetId]['sort_order']) {
+                $pdo->prepare("UPDATE dailytasksT t JOIN (SELECT id, ROW_NUMBER() OVER (ORDER BY sort_order ASC, created_at ASC, id ASC) AS rn FROM dailytasksT WHERE task_date = ?) x ON x.id = t.id SET t.sort_order = x.rn")
+                    ->execute([$rows[$id]['task_date']]);
+                $readStmt->execute([$id, $targetId]);
+                $rows = [];
+                foreach ($readStmt->fetchAll(PDO::FETCH_ASSOC) as $r) $rows[(int)$r['id']] = $r;
+            }
+
+            $upd = $pdo->prepare("UPDATE dailytasksT SET sort_order = ? WHERE id = ?");
+            $upd->execute([(int)$rows[$targetId]['sort_order'], $id]);
+            $upd->execute([(int)$rows[$id]['sort_order'], $targetId]);
+
+            $pdo->commit();
+            echo 'success';
+        } catch (Throwable $e) {
+            if ($pdo->inTransaction()) $pdo->rollBack();
+            http_response_code(400);
+            echo $e->getMessage();
+        }
         exit;
     }
     if ($action === 'delete_attachment') { 
@@ -175,8 +215,9 @@ if ($action) {
             $stmt = $pdo->prepare("UPDATE dailytasksT SET completion_status = ? WHERE id = ?");
             $stmt->execute([$new_date, $id]);
             
-            $stmt2 = $pdo->prepare("INSERT INTO dailytasksT (task_date, content, completion_status) VALUES (?, ?, '')");
-            $stmt2->execute([$new_date, $content]);
+            // 이관 일자의 다음 순서(sort_order = 최대값 + 1)로 등록
+            $stmt2 = $pdo->prepare("INSERT INTO dailytasksT (task_date, content, completion_status, sort_order) SELECT ?, ?, '', COALESCE(MAX(sort_order), 0) + 1 FROM dailytasksT WHERE task_date = ?");
+            $stmt2->execute([$new_date, $content, $new_date]);
             $newTaskId = (int)$pdo->lastInsertId();
 
             // 기존 할일의 활성화(ACTIVE) 상태 첨부파일을 새 할일(newTaskId) 그룹으로 이관 복사
@@ -229,7 +270,8 @@ $stmt->execute([$viewDate]);
 $futureTotalCount = $stmt->fetchColumn();
 
 // 오늘의 할일 목록: 이관된 항목(completion_status 가 날짜값)은 표시하지 않음
-$stmt = $pdo->prepare("SELECT t.*, (SELECT COUNT(*) FROM attachment a WHERE a.att_grp_id = -t.id AND a.status='ACTIVE') AS attachment_count FROM dailytasksT t WHERE t.task_date = ? AND (t.completion_status IS NULL OR t.completion_status = '' OR t.completion_status = '완료') ORDER BY t.id DESC");
+// 정렬 : sort_order → 등록일(created_at) → id,  순번(seq)은 조회된 순서대로 SQL 에서 새로 부여
+$stmt = $pdo->prepare("SELECT t.*, ROW_NUMBER() OVER (ORDER BY t.sort_order ASC, t.created_at ASC, t.id ASC) AS seq, (SELECT COUNT(*) FROM attachment a WHERE a.att_grp_id = -t.id AND a.status='ACTIVE') AS attachment_count FROM dailytasksT t WHERE t.task_date = ? AND (t.completion_status IS NULL OR t.completion_status = '' OR t.completion_status = '완료') ORDER BY t.sort_order ASC, t.created_at ASC, t.id ASC");
 $stmt->execute([$viewDate]);
 $tasks = $stmt->fetchAll(PDO::FETCH_ASSOC);
 
@@ -260,7 +302,18 @@ $futureTasks = $stmt->fetchAll(PDO::FETCH_ASSOC);
     .stat-value { font-size: 16px; font-weight: bold; color: #2c3e50; }
     .stat-value.alert { color: #e74c3c; }
     .task-list { list-style: none; padding: 0; margin: 0; }
-    .task-item { display: flex; justify-content: space-between; align-items: center; background: #fff; padding: 15px; margin-bottom: 10px; border-radius: 8px; box-shadow: 0 1px 4px rgba(0,0,0,0.05); border: 1px solid #eee; }
+    .task-item { display: flex; justify-content: space-between; align-items: center; background: #fff; padding: 15px 0 15px 1px; margin-bottom: 10px; border-radius: 8px; box-shadow: 0 1px 4px rgba(0,0,0,0.05); border: 1px solid #eee; }
+    .task-seq { flex-shrink: 0; min-width: 20px; margin-right: 6px; text-align: right; font-size: 13px; font-weight: bold; color: #7f8c8d; }
+    .task-move { display: flex; flex-shrink: 0; gap: 2px; margin-right: 0; }
+    /* 위/아래 화살표 : 글꼴(문자)에 의존하지 않도록 CSS 삼각형으로 그림 */
+    .task-move-btn { position: relative; display: block; flex-shrink: 0; width: 16px; height: 28px; padding: 0; border: 1px solid #b0b7bf; border-radius: 6px; background: #fff; cursor: pointer; -webkit-appearance: none; appearance: none; }
+    .task-move-btn::before { content: ''; position: absolute; left: 50%; top: 50%; width: 0; height: 0; margin-left: -6px; border-left: 6px solid transparent; border-right: 6px solid transparent; }
+    .task-move-btn.move-up::before { margin-top: -4px; border-bottom: 8px solid #2c3e50; }
+    .task-move-btn.move-down::before { margin-top: -4px; border-top: 8px solid #2c3e50; }
+    .task-move-btn:active { background: #e9ecef; }
+    .task-move-btn:disabled { background: #f5f5f5; border-color: #e3e3e3; cursor: default; }
+    .task-move-btn.move-up:disabled::before { border-bottom-color: #c8c8c8; }
+    .task-move-btn.move-down:disabled::before { border-top-color: #c8c8c8; }
     .task-content-line { flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-size: 15px; cursor: pointer; color: #333; }
     .task-content-line.completed { color: #95a5a6; }
     .task-actions { display: flex; align-items: center; gap: 6px; flex-shrink: 0; }
@@ -276,7 +329,7 @@ $futureTasks = $stmt->fetchAll(PDO::FETCH_ASSOC);
     .selected-file-badge-name { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; max-width:200px; }
     .selected-file-badge-remove { margin-left:6px; cursor:pointer; color:#d32f2f; font-weight:bold; }
     .attachment-help { font-size:10px; color:#888; margin-top:5px; line-height:1.4; }
-    .task-delete-btn { background: none; border: none; color: #e74c3c; font-size: 18px; cursor: pointer; padding: 5px; }
+    .task-delete-btn { background: none; border: none; color: #e74c3c; font-size: 18px; cursor: pointer; padding: 5px 0 5px 5px; margin: 0 3px 0 0; }
     .task-status-tag { font-weight: bold; font-size: 14px; white-space: nowrap; }
     .status-completed { color: #2ecc71; }
     .status-transfer { color: #f39c12; }
@@ -339,13 +392,16 @@ $futureTasks = $stmt->fetchAll(PDO::FETCH_ASSOC);
     <?php if (count($tasks) === 0): ?>
         <li style="text-align: center; color: #999; padding: 20px;">할일이 없어! 새 할일을 추가해 볼까?</li>
     <?php else: ?>
-        <?php foreach ($tasks as $task): 
+        <?php foreach ($tasks as $idx => $task): 
+            $prevTaskId = $tasks[$idx - 1]['id'] ?? 0;   // 화면상 바로 위 할일
+            $nextTaskId = $tasks[$idx + 1]['id'] ?? 0;   // 화면상 바로 아래 할일
             $status = $task['completion_status'];
             $isCompleted = ($status === '완료');
             $isChanged = ($status !== '' && $status !== null &&$status !== '완료');
             $isDoneAny = ($isCompleted || $isChanged);$canDelete = ($dateStatus >= 0 && !$isDoneAny);
         ?>
             <li class="task-item">
+                <span class="task-seq"><?= (int)$task['seq'] ?>.</span>
                 <div class="task-content-line <?= $isDoneAny ? 'completed' : '' ?>" 
                      data-id="<?= $task['id'] ?>" 
                      data-content="<?= htmlspecialchars($task['content'], ENT_QUOTES) ?>" 
@@ -357,6 +413,13 @@ $futureTasks = $stmt->fetchAll(PDO::FETCH_ASSOC);
                     <?php if ($task['attachment_count'] > 0): ?>
                         <span class="task-attachment-icon" title="첨부파일 <?= (int)$task['attachment_count'] ?>개" onclick="openTaskDetail(this.closest('.task-item').querySelector('.task-content-line'))">📎</span>
                     <?php endif; ?>
+
+                    <span class="task-move">
+                        <button type="button" class="task-move-btn move-up" title="위로" aria-label="위로"
+                            <?= $prevTaskId ? 'onclick="moveTask(' . (int)$task['id'] . ', ' . (int)$prevTaskId . ')"' : 'disabled' ?>></button>
+                        <button type="button" class="task-move-btn move-down" title="아래로" aria-label="아래로"
+                            <?= $nextTaskId ? 'onclick="moveTask(' . (int)$task['id'] . ', ' . (int)$nextTaskId . ')"' : 'disabled' ?>></button>
+                    </span>
 
                     <?php if ($isCompleted): ?>
                         <span class="task-status-tag status-completed">[완료]</span>
@@ -510,6 +573,31 @@ $futureTasks = $stmt->fetchAll(PDO::FETCH_ASSOC);
                 if (data.trim() === 'success') { refreshCurrentView(getCurrentViewDate()); }
             });
         }
+    }
+
+    // 위/아래 화살표 : 바로 위(아래)에 있던 할일(targetId)과 순서(sort_order)를 바꾸고 재조회
+    var movingTask = false;
+    function moveTask(id, targetId) {
+        if (movingTask) return; // 연속 터치 방지
+        movingTask = true;
+
+        const formData = new FormData();
+        formData.append('id', id);
+        formData.append('target_id', targetId);
+        fetch('dailytasks.php?action=move_task', { method: 'POST', body: formData })
+        .then(res => res.text().then(text => ({ ok: res.ok, text: text.trim() })))
+        .then(result => {
+            movingTask = false;
+            if (result.ok && result.text === 'success') {
+                refreshCurrentView(getCurrentViewDate());
+            } else {
+                alert('순서를 바꾸지 못했어: ' + result.text);
+            }
+        })
+        .catch(() => {
+            movingTask = false;
+            alert('순서 변경 중 통신 오류가 발생했어.');
+        });
     }
 
     function openTaskDetail(element) {
