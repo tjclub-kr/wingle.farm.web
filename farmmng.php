@@ -94,11 +94,11 @@ function getFarmTaskStats($pdo, $farmId) {
                     grouped_task_id,
                     ROW_NUMBER() OVER (
                         PARTITION BY farm_id, row_num, col_num, grouped_task_id
-                        ORDER BY created_at DESC, id DESC
+                        ORDER BY created_at DESC, ridge_id DESC
                     ) AS rn
                 FROM (
                     SELECT
-                        id,
+                        ridge_id,
                         farm_id,
                         row_num,
                         col_num,

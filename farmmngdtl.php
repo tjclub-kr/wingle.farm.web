@@ -259,7 +259,7 @@ if (isset($_GET['action']) && $_GET['action'] === 'get_ridge_info') {
         $totalCount = (int)$countStmt->fetchColumn();
         $totalPages = (int)ceil($totalCount / $limit);
 
-        $stmt = $pdo->prepare("SELECT id, work_date, task_id, check_status, content, created_at, DATE_FORMAT(created_at, '%Y-%m-%d %H:%i') AS created_minute FROM ridge_records WHERE farm_id = :farm_id AND row_num = :row_num AND col_num = :col_num AND (check_status != 'N' OR check_status IS NULL) ORDER BY id DESC LIMIT {$limit} OFFSET {$offset}");
+        $stmt = $pdo->prepare("SELECT ridge_id, work_date, task_id, check_status, content, created_at, DATE_FORMAT(created_at, '%Y-%m-%d %H:%i') AS created_minute FROM ridge_records WHERE farm_id = :farm_id AND row_num = :row_num AND col_num = :col_num AND (check_status != 'N' OR check_status IS NULL) ORDER BY ridge_id DESC LIMIT {$limit} OFFSET {$offset}");
         $stmt->execute([
             ':farm_id' => $ajaxFarmId,
             ':row_num' => $rowNum,
@@ -464,7 +464,7 @@ if (isset($_GET['action']) && $_GET['action'] === 'get_all_ridges_latest') {
             SELECT row_num, col_num, task_id, work_date, created_at, check_status 
             FROM ridge_records 
             WHERE farm_id = :farm_id 
-            ORDER BY id DESC
+            ORDER BY ridge_id DESC
         ");
         $stmt->execute([':farm_id' => $ajaxFarmId]);
         $records = $stmt->fetchAll();
@@ -613,7 +613,7 @@ try {
         SELECT row_num, col_num, task_id, work_date, created_at, check_status 
         FROM ridge_records 
         WHERE farm_id = :farm_id 
-        ORDER BY id DESC
+        ORDER BY ridge_id DESC
     ");
     $stmt->execute([':farm_id' => $farmId]);
     $allRecords = $stmt->fetchAll();
