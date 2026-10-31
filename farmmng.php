@@ -68,7 +68,7 @@ function getFarmsList($pdo) {
 // 1) check_status='Y' 기록 중 (farm_id,row_num,col_num,작업종류) 별 가장 최근 1건만 선택
 //    (Y 기록이 하나도 없는 이랑은 자연히 제외됨)
 // 2) 작업종류별로 최근일자(MAX)/가장 오래된 일자(MIN)의 오늘까지 경과일 산출
-// 작업 코드: 10=물, 20=수확, 30=옆순, 40~46=농약(가군/나군 → 40으로 통합), 70~72=병충해(70으로 통합)
+// 작업 코드: 10=물, 20=수확, 30=옆순, 40~46=농약(가군/나군 → 40으로 통합), 70~72=영양제(1군/2군/3군 → 70으로 통합)
 function getFarmTaskStats($pdo, $farmId) {
 
     $sql = "
@@ -219,7 +219,7 @@ function renderFarmBox($title, $icon, $groupId, $bgColor, $memoData, $farmParam,
         '10' => ['last' => '-', 'first' => '-'], // 💧 물
         '20' => ['last' => '-', 'first' => '-'], // 🌾 수확
         '30' => ['last' => '-', 'first' => '-'], // ✂️ 옆순
-        '40' => ['last' => '-', 'first' => '-']  // 💊 농약(40~46)
+        '40' => ['last' => '-', 'first' => '-']  // ☠️ 농약(40~46)
     ];
 
     if (!empty($taskStats)) {
@@ -246,12 +246,12 @@ function renderFarmBox($title, $icon, $groupId, $bgColor, $memoData, $farmParam,
                     💧 <?php echo $tasks['10']['last']; ?> 
                     🌾 <?php echo $tasks['20']['last']; ?> 
                     ✂️ <?php echo $tasks['30']['last']; ?> 
-                    💊 <?php echo $tasks['40']['last']; ?> 
+                    ☠️ <?php echo $tasks['40']['last']; ?> 
                     <span class="stat-divider">/</span> 
                     💧 <?php echo $tasks['10']['first']; ?> 
                     🌾 <?php echo $tasks['20']['first']; ?> 
                     ✂️ <?php echo $tasks['30']['first']; ?> 
-                    💊 <?php echo $tasks['40']['first']; ?>
+                    ☠️ <?php echo $tasks['40']['first']; ?>
                 </div>
             </div>
             <div class="memo-section">

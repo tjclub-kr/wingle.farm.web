@@ -19,8 +19,9 @@ $taskMap = [
     '나군5'  => 44,
     '가군7'  => 45,
     '나군7'  => 46,
-    '병해'   => 70,
-    '충해'   => 71
+    '1군'    => 70,
+    '2군'    => 71,
+    '3군'    => 72
 ];
 
 $reverseTaskMap = [
@@ -34,8 +35,9 @@ $reverseTaskMap = [
     44 => '나군5',
     45 => '가군7',
     46 => '나군7',
-    70 => '병해',
-    71 => '충해'
+    70 => '1군',
+    71 => '2군',
+    72 => '3군'
 ];
 
 // --------------------------------------------------
@@ -268,7 +270,7 @@ if (isset($_GET['action']) && $_GET['action'] === 'get_ridge_info') {
         $rawRows = $stmt->fetchAll();
 
         $pesticideTasks = ['가군1', '가군3', '나군3', '가군5', '나군5', '가군7', '나군7'];
-        $pestTasks      = ['병해', '충해'];
+        $pestTasks      = ['1군', '2군', '3군']; // 영양제
 
         $rows = [];
         foreach ($rawRows as $r) {
@@ -278,7 +280,7 @@ if (isset($_GET['action']) && $_GET['action'] === 'get_ridge_info') {
             if (in_array($wType, $pesticideTasks)) {
                 $displayContent = '[농약 - ' . $wType . ']' . ($dbContent !== '' ? ' ' . $dbContent : '');
             } elseif (in_array($wType, $pestTasks)) {
-                $displayContent = '[병충해 - ' . $wType . ']' . ($dbContent !== '' ? ' ' . $dbContent : '');
+                $displayContent = '[영양제 - ' . $wType . ']' . ($dbContent !== '' ? ' ' . $dbContent : '');
             } else {
                 $displayContent = '[' . $wType . '] ' . ($dbContent !== '' ? $dbContent : '작업완료');
             }
@@ -455,6 +457,169 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
     exit;
 }
 
+// ============================================================
+// 이랑 환경 모니터링 데이터 (environment_monitoring_data)
+//  - 이랑(밭 + 행 + 열)을 길게 터치했을 때 열리는 팝업에서 사용
+//  - ridge_id : 터치한 이랑(farm_id, row_num, col_num)의 ridge_records 최신 기록의 ridge_id
+//  - env_mon_id(PK)와 created_at(저장 시각)은 DB 에서 자동 생성
+// ============================================================
+if (!function_exists('envmon_decimal')) {
+    function envmon_decimal($value, string $label, float $min, float $max): ?string
+    {
+        $v = trim((string)$value);
+        if ($v === '') return null;
+        if (!preg_match('/^-?\d+(\.\d+)?$/', $v)) throw new InvalidArgumentException("{$label} 값이 올바르지 않습니다.");
+        $f = (float)$v;
+        if ($f < $min || $f > $max) throw new InvalidArgumentException("{$label} 값은 {$min} ~ {$max} 범위여야 합니다.");
+        return number_format($f, 2, '.', '');
+    }
+    function envmon_int($value, string $label, int $max): ?int
+    {
+        $v = trim((string)$value);
+        if ($v === '') return null;
+        if (!preg_match('/^\d+$/', $v)) throw new InvalidArgumentException("{$label} 값은 0 이상의 정수여야 합니다.");
+        if ((float)$v > $max) throw new InvalidArgumentException("{$label} 값이 너무 큽니다.");
+        return (int)$v;
+    }
+}
+
+// 이력 조회 : 같은 이랑(farm_id, row_num, col_num)의 ridge_records 와 연결된 환경 데이터, 10건씩 페이징
+if (isset($_GET['action']) && $_GET['action'] === 'get_env_monitoring') {
+    header('Content-Type: application/json; charset=utf-8');
+    $envFarmId = intval($_GET['farm_id'] ?? 0);
+    $envRow    = intval($_GET['row_num'] ?? 0);
+    $envCol    = intval($_GET['col_num'] ?? 0);
+    $envPage   = max(1, intval($_GET['page'] ?? 1));
+    $envLimit  = 10;
+    $envOffset = ($envPage - 1) * $envLimit;
+
+    if ($envFarmId <= 0 || $envRow <= 0 || $envCol <= 0) {
+        echo json_encode(['success' => false, 'message' => '유효하지 않은 밭 또는 이랑 파라미터입니다.']);
+        exit;
+    }
+
+    try {
+        $params = [':farm_id' => $envFarmId, ':row_num' => $envRow, ':col_num' => $envCol];
+
+        // 저장에 사용할 ridge_id (해당 이랑의 최신 ridge_records.ridge_id)
+        $ridgeStmt = $pdo->prepare("SELECT MAX(ridge_id) FROM ridge_records WHERE farm_id = :farm_id AND row_num = :row_num AND col_num = :col_num");
+        $ridgeStmt->execute($params);
+        $latestRidgeId = $ridgeStmt->fetchColumn();
+
+        $countStmt = $pdo->prepare("
+            SELECT COUNT(*)
+              FROM environment_monitoring_data e
+              INNER JOIN ridge_records r ON r.ridge_id = e.ridge_id
+             WHERE r.farm_id = :farm_id AND r.row_num = :row_num AND r.col_num = :col_num
+        ");
+        $countStmt->execute($params);
+        $totalCount = (int)$countStmt->fetchColumn();
+        $totalPages = max(1, (int)ceil($totalCount / $envLimit));
+
+        $listStmt = $pdo->prepare("
+            SELECT e.env_mon_id, e.humidity, e.temperature, e.conductivity, e.ph, e.moisture, e.illuminance,
+                   DATE_FORMAT(e.created_at, '%Y-%m-%d %H:%i') AS created_minute
+              FROM environment_monitoring_data e
+              INNER JOIN ridge_records r ON r.ridge_id = e.ridge_id
+             WHERE r.farm_id = :farm_id AND r.row_num = :row_num AND r.col_num = :col_num
+             ORDER BY e.created_at DESC, e.env_mon_id DESC
+             LIMIT {$envLimit} OFFSET {$envOffset}
+        ");
+        $listStmt->execute($params);
+
+        echo json_encode([
+            'success'    => true,
+            'data'       => $listStmt->fetchAll(PDO::FETCH_ASSOC),
+            'page'       => $envPage,
+            'totalPages' => $totalPages,
+            'totalCount' => $totalCount,
+            'can_save'   => ($latestRidgeId !== null && $latestRidgeId !== false)
+        ], JSON_UNESCAPED_UNICODE);
+    } catch (Throwable $e) {
+        error_log('[env_monitoring list] ' . $e->getMessage());
+        echo json_encode(['success' => false, 'message' => '환경 정보 조회 중 오류가 발생했습니다.']);
+    }
+    exit;
+}
+
+// 저장(INSERT) / 수정(UPDATE)
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'save_env_monitoring') {
+    header('Content-Type: application/json; charset=utf-8');
+    $envFarmId = intval($_POST['farm_id'] ?? 0);
+    $envRow    = intval($_POST['row_num'] ?? 0);
+    $envCol    = intval($_POST['col_num'] ?? 0);
+    $envMonId  = intval($_POST['env_mon_id'] ?? 0); // 0 이면 신규 저장, 값이 있으면 수정
+
+    try {
+        if ($envFarmId <= 0 || $envRow <= 0 || $envCol <= 0) throw new InvalidArgumentException('유효하지 않은 밭 또는 이랑 파라미터입니다.');
+
+        $humidity     = envmon_decimal($_POST['humidity'] ?? '', '습도', 0, 100);
+        $temperature  = envmon_decimal($_POST['temperature'] ?? '', '온도', -999.99, 999.99);
+        $conductivity = envmon_decimal($_POST['conductivity'] ?? '', '전기전도도', 0, 99999999.99);
+        $ph           = envmon_decimal($_POST['ph'] ?? '', 'pH', 0, 14);
+        $moisture     = envmon_decimal($_POST['moisture'] ?? '', '토양 수분', 0, 100);
+        $illuminance  = envmon_int($_POST['illuminance'] ?? '', '조도', 4294967295);
+
+        if ($humidity === null && $temperature === null && $conductivity === null && $ph === null && $moisture === null && $illuminance === null) {
+            throw new InvalidArgumentException('저장할 값을 하나 이상 입력해 주세요.');
+        }
+
+        $params = [':farm_id' => $envFarmId, ':row_num' => $envRow, ':col_num' => $envCol];
+
+        if ($envMonId > 0) {
+            // 수정 : 해당 환경 데이터가 터치한 이랑의 데이터인지 확인 후 UPDATE (created_at 은 유지)
+            $chk = $pdo->prepare("
+                SELECT COUNT(*)
+                  FROM environment_monitoring_data e
+                  INNER JOIN ridge_records r ON r.ridge_id = e.ridge_id
+                 WHERE e.env_mon_id = :env_mon_id
+                   AND r.farm_id = :farm_id AND r.row_num = :row_num AND r.col_num = :col_num
+            ");
+            $chk->execute($params + [':env_mon_id' => $envMonId]);
+            if ((int)$chk->fetchColumn() === 0) throw new InvalidArgumentException('수정할 데이터를 찾을 수 없습니다. 목록을 다시 조회해 주세요.');
+
+            $upd = $pdo->prepare("
+                UPDATE environment_monitoring_data
+                   SET humidity = :humidity, temperature = :temperature, conductivity = :conductivity,
+                       ph = :ph, moisture = :moisture, illuminance = :illuminance
+                 WHERE env_mon_id = :env_mon_id
+            ");
+            $upd->execute([
+                ':humidity' => $humidity, ':temperature' => $temperature, ':conductivity' => $conductivity,
+                ':ph' => $ph, ':moisture' => $moisture, ':illuminance' => $illuminance,
+                ':env_mon_id' => $envMonId
+            ]);
+            echo json_encode(['success' => true, 'message' => '수정되었습니다.'], JSON_UNESCAPED_UNICODE);
+            exit;
+        }
+
+        // 신규 저장 : ridge_id = 터치한 이랑의 최신 ridge_records.ridge_id / created_at 은 저장 시점(DB 기본값)
+        $ridgeStmt = $pdo->prepare("SELECT MAX(ridge_id) FROM ridge_records WHERE farm_id = :farm_id AND row_num = :row_num AND col_num = :col_num");
+        $ridgeStmt->execute($params);
+        $ridgeId = $ridgeStmt->fetchColumn();
+        if ($ridgeId === null || $ridgeId === false) {
+            throw new InvalidArgumentException('이 이랑에는 작업 기록(ridge_id)이 없어 저장할 수 없습니다.');
+        }
+
+        $ins = $pdo->prepare("
+            INSERT INTO environment_monitoring_data (ridge_id, humidity, temperature, conductivity, ph, moisture, illuminance)
+            VALUES (:ridge_id, :humidity, :temperature, :conductivity, :ph, :moisture, :illuminance)
+        ");
+        $ins->execute([
+            ':ridge_id' => (int)$ridgeId,
+            ':humidity' => $humidity, ':temperature' => $temperature, ':conductivity' => $conductivity,
+            ':ph' => $ph, ':moisture' => $moisture, ':illuminance' => $illuminance
+        ]);
+        echo json_encode(['success' => true, 'message' => '저장되었습니다.'], JSON_UNESCAPED_UNICODE);
+    } catch (InvalidArgumentException $e) {
+        echo json_encode(['success' => false, 'message' => $e->getMessage()], JSON_UNESCAPED_UNICODE);
+    } catch (Throwable $e) {
+        error_log('[env_monitoring save] ' . $e->getMessage());
+        echo json_encode(['success' => false, 'message' => '저장 중 오류가 발생했습니다.'], JSON_UNESCAPED_UNICODE);
+    }
+    exit;
+}
+
 // 6. AJAX: 그리드 박스의 최근 작업 내역 요약 조회
 if (isset($_GET['action']) && $_GET['action'] === 'get_all_ridges_latest') {
     header('Content-Type: application/json; charset=utf-8');
@@ -485,7 +650,7 @@ if (isset($_GET['action']) && $_GET['action'] === 'get_all_ridges_latest') {
             elseif ($taskName === '수확') $category = '수확';
             elseif ($taskName === '옆순') $category = '옆순';
             elseif (strpos($taskName, '농약') !== false || strpos($taskName, '가군') !== false || strpos($taskName, '나군') !== false) $category = '농약';
-            elseif (in_array($taskName, ['병해', '충해'])) $category = '병충해';
+            elseif (in_array($taskName, ['1군', '2군', '3군'])) $category = '영양제';
 
             if ($category && !isset($gridData[$key][$category])) {
                 $gridData[$key][$category] = $rec['work_date'];
@@ -633,7 +798,7 @@ try {
         elseif ($taskName === '수확') $category = '수확';
         elseif ($taskName === '옆순') $category = '옆순';
         elseif (strpos($taskName, '농약') !== false || strpos($taskName, '가군') !== false || strpos($taskName, '나군') !== false) $category = '농약';
-        elseif (in_array($taskName, ['병해', '충해'])) $category = '병충해';
+        elseif (in_array($taskName, ['1군', '2군', '3군'])) $category = '영양제';
 
         if ($category && !isset($initialGridData[$key][$category])) {
             $initialGridData[$key][$category] = $rec['work_date'];
@@ -687,7 +852,7 @@ function getTaskStyleAndText($taskName, $workDate) {
             $textColor = '#e65100';
             $isActive = true;
         }
-    } elseif ($taskName === '병충해') {
+    } elseif ($taskName === '영양제') {
         if ($days <= 3) {
             $bgColor = '#ffebee';
             $textColor = '#c62828';
@@ -814,7 +979,7 @@ $todayDate = date('Y-m-d');
 .status-btn:active { transform: scale(0.97); }
 
 .main-grid-container { display: grid; grid-template-columns: repeat(<?php echo $rowCount > 0 ? $rowCount : 4; ?>, 1fr); gap: 6px; background-color: #fafafa; padding: 10px; border-radius: 6px; border: 1px solid #e0e0e0; align-items: start; }
-.main-grid-box { min-height: auto; height: fit-content; background-color: #ffffff; border: 1px solid #cccccc; border-radius: 4px; display: flex; flex-direction: column; align-items: center; justify-content: flex-start; padding: 4px; cursor: pointer; transition: background-color 0.2s ease, border-color 0.2s ease; box-shadow: inset 0 1px 2px rgba(0,0,0,0.03); }
+.main-grid-box { -webkit-touch-callout: none; -webkit-user-select: none; user-select: none; min-height: auto; height: fit-content; background-color: #ffffff; border: 1px solid #cccccc; border-radius: 4px; display: flex; flex-direction: column; align-items: center; justify-content: flex-start; padding: 4px; cursor: pointer; transition: background-color 0.2s ease, border-color 0.2s ease; box-shadow: inset 0 1px 2px rgba(0,0,0,0.03); }
 
 .grid-box-title { font-weight: bold; font-size: 0.8rem; color: #333; margin-bottom: 2px; border-bottom: 1px solid #eee; width: 100%; text-align: center; }
 .grid-sub-lines { display: flex; flex-direction: column; width: 100%; font-size: 0.68rem; gap: 1px; }
@@ -873,6 +1038,24 @@ $todayDate = date('Y-m-d');
 .status-grid-table input[type="checkbox"] { width: 18px; height: 18px; cursor: pointer; }
 .grid-btn-group { display: flex; justify-content: space-between; align-items: center; margin-top: 4px; }
 .btn-grid-save { padding: 8px 16px; background-color: #4CAF50; color: white; border: none; border-radius: 4px; cursor: pointer; font-weight: bold; }
+.env-modal-content { max-height: 92vh; overflow-y: auto; gap: 10px; }
+.env-form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px 10px; }
+.env-form-grid label { display: flex; flex-direction: column; gap: 2px; font-size: 0.75rem; color: #555; font-weight: bold; }
+.env-form-grid input { width: 100%; box-sizing: border-box; padding: 7px 8px; border: 1px solid #ddd; border-radius: 4px; font-size: 0.9rem; font-family: inherit; }
+.env-btn-row { display: flex; justify-content: flex-end; gap: 8px; }
+.env-msg { height: 16px; line-height: 16px; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; font-size: 0.75rem; text-align: right; color: #2e7d32; }
+.env-msg.error { color: #c62828; }
+.env-history-title { font-size: 0.8rem; font-weight: bold; color: #333; border-top: 1px solid #eee; padding-top: 8px; display: flex; justify-content: space-between; }
+/* 이력 영역은 데이터 건수와 관계없이 항상 같은 크기 (헤더 1줄 + 10행 고정) */
+.env-table-wrap { height: 248px; overflow-x: auto; overflow-y: hidden; flex-shrink: 0; }
+.env-table { width: 100%; table-layout: fixed; border-collapse: collapse; font-size: 0.68rem; text-align: center; white-space: nowrap; }
+.env-table th { height: 24px; background: #f1f8e9; color: #33691e; padding: 0 3px; border: 1px solid #dcedc8; box-sizing: border-box; }
+.env-table td { height: 22px; padding: 0 3px; border: 1px solid #eee; cursor: pointer; box-sizing: border-box; overflow: hidden; text-overflow: ellipsis; }
+.env-table td.env-blank { cursor: default; }
+.env-table tr.env-selected td { background: #fff8e1; }
+.env-table tr:active td.env-data { background: #f5f5f5; }
+.env-table td.env-empty { color: #999; cursor: default; }
+#envPagination { height: 34px; min-height: 34px; box-sizing: border-box; flex-shrink: 0; }
 .btn-grid-close { padding: 8px 14px; background-color: #666; color: white; border: none; border-radius: 4px; cursor: pointer; }
 .ridge-info-list { list-style: none; padding: 0; margin: 0; height: 280px; overflow-y: auto; }
 .ridge-info-item { display: flex; justify-content: space-between; align-items: center; padding: 8px 4px; border-bottom: 1px solid #f0f0f0; font-size: 0.85rem; cursor: pointer; transition: background-color 0.2s; }
@@ -902,8 +1085,8 @@ $todayDate = date('Y-m-d');
             <button type="button" class="filter-btn" data-filter="물" onclick="toggleFilter(this)" title="물">💧</button>
             <button type="button" class="filter-btn" data-filter="수확" onclick="toggleFilter(this)" title="수확">🌾</button>
             <button type="button" class="filter-btn" data-filter="옆순" onclick="toggleFilter(this)" title="옆순">✂️</button>
-            <button type="button" class="filter-btn" data-filter="농약" onclick="toggleFilter(this)" title="농약">💊</button>
-            <button type="button" class="filter-btn" data-filter="병충해" onclick="toggleFilter(this)" title="병충해">🐛</button>
+            <button type="button" class="filter-btn" data-filter="농약" onclick="toggleFilter(this)" title="농약">☠️</button>
+            <button type="button" class="filter-btn" data-filter="영양제" onclick="toggleFilter(this)" title="영양제">💊</button>
         </div>
     </div>
 
@@ -912,8 +1095,8 @@ $todayDate = date('Y-m-d');
             <button type="button" class="status-btn" onclick="openStatusGridModal('물')">💧</button>
             <button type="button" class="status-btn" onclick="openStatusGridModal('수확')">🌾</button>
             <button type="button" class="status-btn" onclick="openStatusGridModal('옆순')">✂️</button>
-            <button type="button" class="status-btn" onclick="openPesticideGridModal()">💊</button>
-            <button type="button" class="status-btn" onclick="openPestGridModal()">🐛</button>
+            <button type="button" class="status-btn" onclick="openPesticideGridModal()">☠️</button>
+            <button type="button" class="status-btn" onclick="openPestGridModal()">💊</button>
         </div>
 
         <div class="main-grid-container" id="mainGridContainer">
@@ -928,17 +1111,17 @@ $todayDate = date('Y-m-d');
                     $wHarvest = isset($initialGridData[$ridgeKey]['수확']) ? getTaskStyleAndText('수확', $initialGridData[$ridgeKey]['수확']) : ['text' => '-', 'style' => 'color: #999; background: transparent;'];
                     $wSide    = isset($initialGridData[$ridgeKey]['옆순']) ? getTaskStyleAndText('옆순', $initialGridData[$ridgeKey]['옆순']) : ['text' => '-', 'style' => 'color: #999; background: transparent;'];
                     $wPest    = isset($initialGridData[$ridgeKey]['농약']) ? getTaskStyleAndText('농약', $initialGridData[$ridgeKey]['농약']) : ['text' => '-', 'style' => 'color: #999; background: transparent;'];
-                    $wPestDisease = isset($initialGridData[$ridgeKey]['병충해']) ? getTaskStyleAndText('병충해', $initialGridData[$ridgeKey]['병충해']) : ['text' => '-', 'style' => 'color: #999; background: transparent;'];
+                    $wPestDisease = isset($initialGridData[$ridgeKey]['영양제']) ? getTaskStyleAndText('영양제', $initialGridData[$ridgeKey]['영양제']) : ['text' => '-', 'style' => 'color: #999; background: transparent;'];
 
                     echo "
-                    <div class='main-grid-box' onclick=\"openRidgeInfoModal('{$ridgeTitle}', 1, {$r}, {$colNum})\">
+                    <div class='main-grid-box' data-ridge-title='{$ridgeTitle}' data-row='{$r}' data-col='{$colNum}' onclick=\"openRidgeInfoModal('{$ridgeTitle}', 1, {$r}, {$colNum})\">
                         <div class='grid-box-title'>{$ridgeTitle}</div>
                         <div class='grid-sub-lines' id='box-lines-{$r}-{$c}'>
                             <div class='sub-line-item' data-task='물' style='{$wWater['style']}'><span>물</span><span>{$wWater['text']}</span></div>
                             <div class='sub-line-item' data-task='수확' style='{$wHarvest['style']}'><span>수확</span><span>{$wHarvest['text']}</span></div>
                             <div class='sub-line-item' data-task='옆순' style='{$wSide['style']}'><span>옆순</span><span>{$wSide['text']}</span></div>
                             <div class='sub-line-item' data-task='농약' style='{$wPest['style']}'><span>농약</span><span>{$wPest['text']}</span></div>
-                            <div class='sub-line-item' data-task='병충해' style='{$wPestDisease['style']}'><span>병충해</span><span>{$wPestDisease['text']}</span></div>
+                            <div class='sub-line-item' data-task='영양제' style='{$wPestDisease['style']}'><span>영양제</span><span>{$wPestDisease['text']}</span></div>
                         </div>
                     </div>";
                 }
@@ -1090,8 +1273,9 @@ $todayDate = date('Y-m-d');
             <h3>
                 <span id="pestModalTitle">상태 입력</span>
                 <select id="pestSelect" class="pesticide-select">
-                    <option value="병해">병해</option>
-                    <option value="충해">충해</option>
+                    <option value="1군">1군</option>
+                    <option value="2군">2군</option>
+                    <option value="3군">3군</option>
                 </select>
             </h3>
             <span style="cursor:pointer; font-size: 1.2rem;" onclick="closePestGridModal()">✖</span>
@@ -1102,7 +1286,7 @@ $todayDate = date('Y-m-d');
         </div>
         <div class="content-input-row">
             <label for="pestContent">📝 내용 (선택):</label>
-            <textarea id="pestContent" placeholder="병충해 관련 내용을 입력하세요"></textarea>
+            <textarea id="pestContent" placeholder="영양제 관련 내용을 입력하세요"></textarea>
         </div>
         <table class="status-grid-table">
             <thead>
@@ -1228,10 +1412,11 @@ $todayDate = date('Y-m-d');
     <div class="grid-modal-content">
         <div class="grid-modal-header">
             <h3>
-                <span id="pestHistoryBatchTitle">병충해 이랑 상태 수정</span>
+                <span id="pestHistoryBatchTitle">영양제 이랑 상태 수정</span>
                 <select id="pestHistorySelect" class="pesticide-select">
-                    <option value="병해">병해</option>
-                    <option value="충해">충해</option>
+                    <option value="1군">1군</option>
+                    <option value="2군">2군</option>
+                    <option value="3군">3군</option>
                 </select>
             </h3>
             <span style="cursor:pointer; font-size: 1.2rem;" onclick="closePestHistoryBatchModal()">✖</span>
@@ -1268,6 +1453,43 @@ $todayDate = date('Y-m-d');
             <button type="button" class="btn-grid-save" onclick="savePestHistoryBatchGrid()">저장</button>
             <button type="button" class="btn-grid-close" onclick="closePestHistoryBatchModal()">닫기</button>
         </div>
+    </div>
+</div>
+
+<!-- 이랑 영역을 길게 터치했을 때 열리는 팝업 : 환경 모니터링 데이터 입력/수정 + 이력(10건씩 페이징) / 팝업 바깥을 터치하면 닫힘 -->
+<div id="ridgeLongPressModal" class="grid-modal-overlay" onclick="if (event.target === this) closeRidgeLongPressModal();">
+    <div class="grid-modal-content env-modal-content">
+        <div class="grid-modal-header">
+            <h3 id="envModalTitle">환경 정보</h3>
+            <span style="cursor:pointer; font-size: 1.2rem;" onclick="closeRidgeLongPressModal(true)">✖</span>
+        </div>
+
+        <div class="env-form-grid">
+            <label>습도 (%)<input type="number" id="env-humidity" inputmode="decimal" step="any"></label>
+            <label>온도<input type="number" id="env-temperature" inputmode="decimal" step="any"></label>
+            <label>전기전도도 (µS/cm)<input type="number" id="env-conductivity" inputmode="decimal" step="any"></label>
+            <label>pH<input type="number" id="env-ph" inputmode="decimal" step="any"></label>
+            <label>토양 수분 (%)<input type="number" id="env-moisture" inputmode="decimal" step="any"></label>
+            <label>조도 (lux)<input type="number" id="env-illuminance" inputmode="numeric" step="1"></label>
+        </div>
+
+        <div class="env-msg" id="envMsg"></div>
+        <div class="env-btn-row">
+            <button type="button" class="btn-grid-close" id="envCancelBtn" style="display:none;" onclick="cancelEnvEdit()">취소</button>
+            <button type="button" class="btn-grid-save" id="envSaveBtn" onclick="saveEnvMonitoring()">저장</button>
+        </div>
+
+        <div class="env-history-title"><span>입력 이력</span><span id="envTotalCount" style="font-weight:normal; color:#888;"></span></div>
+        <div class="env-table-wrap">
+            <table class="env-table">
+                <colgroup><col style="width:22%"><col style="width:13%"><col style="width:13%"><col style="width:14%"><col style="width:12%"><col style="width:13%"><col style="width:13%"></colgroup>
+                <thead>
+                    <tr><th>일시</th><th>습도</th><th>온도</th><th>전도도</th><th>pH</th><th>수분</th><th>조도</th></tr>
+                </thead>
+                <tbody id="envHistoryBody"></tbody>
+            </table>
+        </div>
+        <div class="ridge-pagination" id="envPagination"></div>
     </div>
 </div>
 
@@ -1630,7 +1852,7 @@ $todayDate = date('Y-m-d');
             if (days > 3) { bgColor = '#e8f5e9'; textColor = '#2e7d32'; isActive = true; }
         } else if (taskName === '농약') {
             if (days <= 3) { bgColor = '#ffe0b2'; textColor = '#e65100'; isActive = true; }
-        } else if (taskName === '병충해') {
+        } else if (taskName === '영양제') {
             if (days <= 3) { bgColor = '#ffebee'; textColor = '#c62828'; isActive = true; }
         }
 
@@ -1644,7 +1866,7 @@ $todayDate = date('Y-m-d');
         .then(res => {
             if (res.success) {
                 const gridData = res.data;
-                const tasks = ['물', '수확', '옆순', '농약', '병충해'];
+                const tasks = ['물', '수확', '옆순', '농약', '영양제'];
                 for (let r = 1; r <= <?php echo $colCount; ?>; r++) {
                     const cols = <?php echo json_encode($cols); ?>;
                     cols.forEach(c => {
@@ -1753,7 +1975,7 @@ $todayDate = date('Y-m-d');
 
     function openBatchModalByTask(taskId, createdMinute, workType) {
         const pesticideTasks = [40, 41, 42, 43, 44, 45, 46];
-        const pestTasks = [70, 71];
+        const pestTasks = [70, 71, 72]; // 영양제 (1군/2군/3군)
 
         if (pesticideTasks.includes(Number(taskId))) {
             openPesticideHistoryBatchModal(taskId, createdMinute, workType);
@@ -1839,7 +2061,7 @@ $todayDate = date('Y-m-d');
         currentPestBatchCreatedMinute = createdMinute;
 
         uncheckAllGrids('pestHistoryBatchModal');
-        document.getElementById('pestHistoryBatchTitle').innerText = `병충해 이랑 상태 수정`;
+        document.getElementById('pestHistoryBatchTitle').innerText = `영양제 이랑 상태 수정`;
         document.getElementById('pestHistorySelect').value = workType;
         document.getElementById('pestHistoryBatchDate').value = createdMinute.substring(0, 10);
 
@@ -1865,7 +2087,7 @@ $todayDate = date('Y-m-d');
 
     function savePestHistoryBatchGrid() {
         const selectedWorkType = document.getElementById('pestHistorySelect').value;
-        const pestTaskMap = { '병해': 70, '충해': 71 };
+        const pestTaskMap = { '1군': 70, '2군': 71, '3군': 72 };
         const newTaskId = pestTaskMap[selectedWorkType] || currentPestBatchTaskId;
         saveBatchGridCommon('pestHistoryBatchModal', currentPestBatchTaskId, currentPestBatchCreatedMinute, 'pestHistoryBatchDate', 'pestHistoryBatchContent', closePestHistoryBatchModal, newTaskId);
     }
@@ -1914,5 +2136,271 @@ $todayDate = date('Y-m-d');
             }
         })
         .catch(err => alert('통신 오류가 발생했습니다.'));
+    }
+
+    // ===== 이랑 영역 길게 터치 : 환경 모니터링 데이터 입력/수정 팝업 =====
+    // ※ 화면을 다시 불러와도 스크립트가 재실행되므로 전역 변수는 let/const 가 아닌 var 로 선언
+    var ENV_FIELDS = ['humidity', 'temperature', 'conductivity', 'ph', 'moisture', 'illuminance'];
+    var envCtx = { row: 0, col: 0, title: '' };
+    var envEditingId = null;     // 수정 중인 env_mon_id (null 이면 신규 저장)
+    var envPage = 1;
+    var envRows = [];
+    var envCanSave = true;
+    var envLoadToken = 0;
+    var envSaving = false;
+    var ridgeLongPressOpenedAt = 0;
+
+    function openRidgeLongPressModal(box) {
+        const modal = document.getElementById('ridgeLongPressModal');
+        if (!modal || !box) return;
+        envCtx = {
+            row: parseInt(box.getAttribute('data-row'), 10) || 0,
+            col: parseInt(box.getAttribute('data-col'), 10) || 0,
+            title: box.getAttribute('data-ridge-title') || ''
+        };
+        document.getElementById('envModalTitle').innerText = `${envCtx.title} 환경 정보`;
+        envClearForm();
+        envShowMsg('');
+        envSetBodyMessage('조회 중...');
+        document.getElementById('envPagination').innerHTML = '';
+        document.getElementById('envTotalCount').innerText = '';
+        ridgeLongPressOpenedAt = Date.now();
+        modal.style.display = 'flex';
+        loadEnvHistory(1);
+    }
+
+    function closeRidgeLongPressModal(force) {
+        // 길게 터치 후 손을 떼는 순간 팝업이 바로 닫히지 않도록 열린 직후에는 무시
+        if (!force && Date.now() - ridgeLongPressOpenedAt < 500) return;
+        envLoadToken++;
+        const modal = document.getElementById('ridgeLongPressModal');
+        if (modal) modal.style.display = 'none';
+        envClearForm();
+    }
+
+    function envShowMsg(text, isError) {
+        const el = document.getElementById('envMsg');
+        if (!el) return;
+        el.innerText = text || '';
+        el.className = 'env-msg' + (isError ? ' error' : '');
+    }
+
+    // 입력 컴포넌트 초기화 + 저장 모드로 복귀
+    function envClearForm() {
+        ENV_FIELDS.forEach(f => { const el = document.getElementById('env-' + f); if (el) el.value = ''; });
+        envEditingId = null;
+        envUpdateButtons();
+        envHighlightSelected();
+    }
+
+    function envUpdateButtons() {
+        const saveBtn = document.getElementById('envSaveBtn');
+        const cancelBtn = document.getElementById('envCancelBtn');
+        if (saveBtn) saveBtn.innerText = envEditingId ? '수정' : '저장';
+        if (cancelBtn) cancelBtn.style.display = envEditingId ? 'inline-block' : 'none';
+    }
+
+    function envHighlightSelected() {
+        document.querySelectorAll('#envHistoryBody tr[data-env-id]').forEach(tr => {
+            tr.classList.toggle('env-selected', envEditingId !== null && tr.getAttribute('data-env-id') === String(envEditingId));
+        });
+    }
+
+    function cancelEnvEdit() {
+        envClearForm();
+        envShowMsg('');
+    }
+
+    // DB 의 DECIMAL 값("12.50")을 화면용("12.5") 으로 변환
+    function envFmt(v) {
+        if (v === null || v === undefined || v === '') return '-';
+        const n = Number(v);
+        return isNaN(n) ? '-' : String(n);
+    }
+
+    // 표 본문 : 항상 10행으로 맞춤 (데이터가 적으면 빈 행으로 채워 팝업 크기가 변하지 않게 함)
+    var ENV_PAGE_SIZE = 10;
+    function envBlankRows(count) {
+        let html = '';
+        for (let i = 0; i < count; i++) html += '<tr>' + '<td class="env-blank">&nbsp;</td>'.repeat(7) + '</tr>';
+        return html;
+    }
+    function envSetBodyMessage(text) {
+        document.getElementById('envHistoryBody').innerHTML =
+            `<tr><td class="env-empty" colspan="7">${escapeHtml(text)}</td></tr>` + envBlankRows(ENV_PAGE_SIZE - 1);
+    }
+
+    function loadEnvHistory(page) {
+        const token = ++envLoadToken;
+        fetch(`${memoAjaxUrl}?action=get_env_monitoring&farm_id=${farmId}&row_num=${envCtx.row}&col_num=${envCtx.col}&page=${page}`)
+        .then(res => res.json())
+        .then(res => {
+            if (token !== envLoadToken) return; // 팝업이 닫혔거나 다른 이랑의 요청 결과
+            if (!res.success) {
+                envSetBodyMessage(res.message || '조회 실패');
+                document.getElementById('envPagination').innerHTML = '';
+                return;
+            }
+            envPage = res.page;
+            envRows = res.data || [];
+            envCanSave = !!res.can_save;
+            document.getElementById('envTotalCount').innerText = `총 ${res.totalCount}건`;
+            if (!envCanSave) envShowMsg('이 이랑에는 작업 기록이 없어 저장할 수 없어요.', true);
+            renderEnvHistory();
+            renderEnvPagination(res.page, res.totalPages);
+        })
+        .catch(() => {
+            if (token !== envLoadToken) return;
+            envSetBodyMessage('조회 중 오류가 발생했습니다.');
+        });
+    }
+
+    function renderEnvHistory() {
+        const body = document.getElementById('envHistoryBody');
+        if (!envRows.length) {
+            envSetBodyMessage('입력한 이력이 없습니다.');
+            return;
+        }
+        const dataRowsHtml = envRows.map(r => {
+            const d = String(r.created_minute || '');
+            const dateText = d.length >= 16 ? d.substring(5, 16) : d; // MM-DD HH:mm
+            return `<tr data-env-id="${r.env_mon_id}" onclick="envSelectRow(${r.env_mon_id})">`
+                + `<td class="env-data">${escapeHtml(dateText)}</td>`
+                + `<td class="env-data">${envFmt(r.humidity)}</td><td class="env-data">${envFmt(r.temperature)}</td><td class="env-data">${envFmt(r.conductivity)}</td>`
+                + `<td class="env-data">${envFmt(r.ph)}</td><td class="env-data">${envFmt(r.moisture)}</td><td class="env-data">${envFmt(r.illuminance)}</td></tr>`;
+        }).join('');
+        body.innerHTML = dataRowsHtml + envBlankRows(Math.max(0, ENV_PAGE_SIZE - envRows.length));
+        envHighlightSelected();
+    }
+
+    // 페이징 (현재 페이지 기준 최대 5개 번호 표시)
+    function renderEnvPagination(currentPage, totalPages) {
+        const pagination = document.getElementById('envPagination');
+        pagination.innerHTML = '';
+        if (totalPages <= 1) return;
+
+        const addBtn = (label, page, disabled, active) => {
+            const b = document.createElement('button');
+            b.innerText = label;
+            b.disabled = !!disabled;
+            if (active) b.className = 'active';
+            b.onclick = () => loadEnvHistory(page);
+            pagination.appendChild(b);
+        };
+
+        let start = Math.max(1, currentPage - 2);
+        let end = Math.min(totalPages, start + 4);
+        start = Math.max(1, end - 4);
+
+        addBtn('<', currentPage - 1, currentPage === 1, false);
+        for (let i = start; i <= end; i++) addBtn(String(i), i, false, i === currentPage);
+        addBtn('>', currentPage + 1, currentPage === totalPages, false);
+    }
+
+    // 이력 행 터치 : 상단 입력 영역에 값을 채우고 수정 모드로 전환
+    function envSelectRow(envMonId) {
+        const row = envRows.find(r => Number(r.env_mon_id) === Number(envMonId));
+        if (!row) return;
+        ENV_FIELDS.forEach(f => {
+            const el = document.getElementById('env-' + f);
+            if (el) el.value = (row[f] === null || row[f] === undefined) ? '' : String(Number(row[f]));
+        });
+        envEditingId = Number(envMonId);
+        envUpdateButtons();
+        envHighlightSelected();
+        envShowMsg('수정할 값을 바꾼 뒤 [수정]을 눌러줘.');
+        const content = document.querySelector('#ridgeLongPressModal .env-modal-content');
+        if (content) content.scrollTop = 0;
+    }
+
+    function saveEnvMonitoring() {
+        if (envSaving) return;
+        const values = {};
+        let hasValue = false;
+        ENV_FIELDS.forEach(f => {
+            values[f] = document.getElementById('env-' + f).value.trim();
+            if (values[f] !== '') hasValue = true;
+        });
+        if (!hasValue) return envShowMsg('저장할 값을 하나 이상 입력해 줘!', true);
+        if (!envEditingId && !envCanSave) return envShowMsg('이 이랑에는 작업 기록이 없어 저장할 수 없어요.', true);
+
+        const wasEditing = envEditingId !== null;
+        const formData = new FormData();
+        formData.append('action', 'save_env_monitoring');
+        formData.append('farm_id', farmId);
+        formData.append('row_num', envCtx.row);
+        formData.append('col_num', envCtx.col);
+        if (wasEditing) formData.append('env_mon_id', envEditingId);
+        ENV_FIELDS.forEach(f => formData.append(f, values[f]));
+
+        envSaving = true;
+        const saveBtn = document.getElementById('envSaveBtn');
+        if (saveBtn) saveBtn.disabled = true;
+
+        fetch(memoAjaxUrl, { method: 'POST', body: formData })
+        .then(res => res.json())
+        .then(res => {
+            if (!res.success) return envShowMsg(res.message || '저장 실패', true);
+            envClearForm();                              // 입력 컴포넌트 클리어 (저장 모드로 복귀)
+            envShowMsg(res.message || '저장되었습니다.');
+            loadEnvHistory(wasEditing ? envPage : 1);    // 신규 저장은 1페이지(최신), 수정은 보던 페이지 유지
+        })
+        .catch(() => envShowMsg('통신 오류가 발생했습니다.', true))
+        .finally(() => {
+            envSaving = false;
+            if (saveBtn) saveBtn.disabled = false;
+        });
+    }
+
+    // 문서 단위로 한 번만 등록 (화면을 다시 불러와도 중복 등록되지 않도록 함)
+    if (!window.__ridgeLongPressBound) {
+        window.__ridgeLongPressBound = true;
+
+        const LONG_PRESS_MS = 600;   // 길게 터치로 인정하는 시간
+        const MOVE_LIMIT_PX = 10;    // 이 거리 이상 움직이면(스크롤 등) 길게 터치 취소
+        let pressTimer = null;
+        let startX = 0, startY = 0;
+        let longPressFired = false;
+
+        function cancelPress() {
+            if (pressTimer) { clearTimeout(pressTimer); pressTimer = null; }
+        }
+
+        document.addEventListener('pointerdown', function (e) {
+            const box = e.target.closest ? e.target.closest('.main-grid-box') : null;
+            if (!box) return;
+            // 팝업 안(입력창 등)에서의 터치는 무시
+            longPressFired = false;
+            startX = e.clientX;
+            startY = e.clientY;
+            cancelPress();
+            pressTimer = setTimeout(function () {
+                pressTimer = null;
+                longPressFired = true;
+                openRidgeLongPressModal(box);
+            }, LONG_PRESS_MS);
+        });
+
+        document.addEventListener('pointermove', function (e) {
+            if (pressTimer && (Math.abs(e.clientX - startX) > MOVE_LIMIT_PX || Math.abs(e.clientY - startY) > MOVE_LIMIT_PX)) {
+                cancelPress();
+            }
+        });
+        document.addEventListener('pointerup', cancelPress);
+        document.addEventListener('pointercancel', cancelPress);
+
+        // 길게 터치 후 손을 뗄 때 발생하는 click 이 단순 터치 팝업(이랑 정보)을 열지 않도록 차단
+        document.addEventListener('click', function (e) {
+            if (longPressFired && e.target.closest && e.target.closest('.main-grid-box')) {
+                e.stopPropagation();
+                e.preventDefault();
+            }
+            longPressFired = false;
+        }, true);
+
+        // 길게 누를 때 뜨는 브라우저 기본 메뉴(컨텍스트 메뉴) 차단
+        document.addEventListener('contextmenu', function (e) {
+            if (e.target.closest && e.target.closest('.main-grid-box')) e.preventDefault();
+        });
     }
 </script>
